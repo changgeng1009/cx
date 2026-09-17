@@ -1,0 +1,37 @@
+{
+  "id": "xuexitong-mcp",
+  "name": "DanMo661/Xuexitong-mcp Adapter（读侧主力）",
+  "kind": "subprocess",
+  "enabled": true,
+  "priority": 10,
+  "upstream": {
+    "repo": "https://github.com/DanMo661/Xuexitong-mcp",
+    "path": "upstreams/xuexitong-mcp",
+    "pinned_commit": "ebce2cc735bc7acc45fac7ccf32bcefe1a6b2a54",
+    "license": "MIT",
+    "isolation": "process",
+    "note": "MIT。经 subprocess worker 调用其 ChaoxingClient（非 MCP 协议），cookie 走文件边界桥接（session_cookies.json），零改上游。项目较新（建仓 2026-09-11），已锁 commit。"
+  },
+  "runtime": {
+    "language": "python",
+    "version": ">=3.10",
+    "install": "python -m pip install requests pycryptodome",
+    "entry": "orchestrator/adapters/xtmcp_worker.py（stdin/stdout JSON 协议）"
+  },
+  "capabilities": {
+    "C06": { "level": "full", "op": "fetch_courses" },
+    "C07": { "level": "full", "op": "fetch_course_meta / fetch_profile" },
+    "C08": { "level": "full", "op": "fetch_chapters", "note": "章节树+任务点状态文本；类型细化（C09）由统一层自建，不在本 Adapter" },
+    "C10": { "level": "full", "op": "fetch_progress_overview" },
+    "C11": { "level": "full", "op": "fetch_progress_overview" },
+    "C29": { "level": "full", "op": "fetch_deadline_overview / fetch_homework" },
+    "C30": { "level": "full", "op": "fetch_exams" },
+    "C31": { "level": "full", "op": "fetch_notices", "note": "服务端 kw 无效，关键词过滤在客户端做" },
+    "C33": { "level": "full", "op": "fetch_schedule" }
+  },
+  "health": {
+    "probe": { "method": "worker_ping", "timeout_ms": 15000, "note": "ping 无网络副作用；真实连通性由 cookies_verify 承担" },
+    "degrade_on": ["platform_changed", "auth"]
+  },
+  "limits": { "max_concurrency": 1, "min_interval_ms": 800 }
+}

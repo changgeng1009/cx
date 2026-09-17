@@ -1,0 +1,32 @@
+[project]
+name = "chaoxing-orchestrator"
+version = "0.1.0"
+description = "学习通自动化能力平台：把多个独立第三方学习通工具统一成可被 Agent / MCP Client 调用的能力层"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# 零第三方依赖是有意的：统一层要保持可审计、可离线自证。
+# 上游项目（GPL-3.0 等）的依赖属于各自 workdir，不进入本包。
+dependencies = []
+
+[project.optional-dependencies]
+# M4 计划改用官方 mcp SDK 替代手写的最小实现
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+orchestrator = "orchestrator.cli:main"
+orchestrator-mcp = "orchestrator.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["orchestrator", "orchestrator.adapters"]
+
+[tool.setuptools.package-data]
+"orchestrator.adapters" = ["manifests/*.json"]
+
+[tool.unittest]
+start-dir = "tests"

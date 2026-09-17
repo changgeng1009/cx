@@ -1,0 +1,32 @@
+{
+  "id": "chaoxing-cli",
+  "name": "Samueli924/chaoxing CLI Adapter（写侧主力）",
+  "kind": "subprocess",
+  "enabled": true,
+  "priority": 15,
+  "upstream": {
+    "repo": "https://github.com/Samueli924/chaoxing",
+    "path": "upstreams/chaoxing",
+    "pinned_commit": "556ccc1556823ff5c8dc1ac4ad26307217b25795",
+    "license": "GPL-3.0",
+    "isolation": "process",
+    "note": "GPL-3.0：仅 subprocess（cxcli_worker.py，stdin/stdout JSON 协议 + 任务点边界协作式取消）。cookie 走文件边界（cookies.txt header 格式，worker cwd=账号工作区）。上游零改动。"
+  },
+  "runtime": {
+    "language": "python",
+    "version": ">=3.11",
+    "install": "python -m pip install requests pyaes beautifulsoup4 lxml loguru tqdm openai fonttools tenacity chardet httpx ddddocr",
+    "entry": "orchestrator/adapters/cxcli_worker.py"
+  },
+  "capabilities": {
+    "C09": { "level": "full", "op": "scan_tasks", "note": "任务点细化（自建 C09 的真实数据源）：get_course_point + get_job_list 逐章扫描，纯 GET" },
+    "C12": { "level": "full", "op": "run", "params": ["speed"], "note": "视频任务；上游 study_video 对音频任务自动 fallback Audio" },
+    "C14": { "level": "full", "op": "run", "note": "文档/阅读任务（document + read）" },
+    "C18": { "level": "full", "op": "run", "note": "整课/单章（chapter_id 过滤在 worker 编排层做，任务点处理走上游 process_job）" }
+  },
+  "health": {
+    "probe": { "method": "worker_ping", "timeout_ms": 20000, "note": "ping 无网络副作用；真实连通性由 worker 登录探测承担" },
+    "degrade_on": ["platform_changed", "risk_control"]
+  },
+  "limits": { "max_concurrency": 1, "min_interval_ms": 1500 }
+}

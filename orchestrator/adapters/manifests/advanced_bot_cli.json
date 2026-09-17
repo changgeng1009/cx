@@ -1,0 +1,46 @@
+{
+  "id": "advanced-bot",
+  "name": "nothing-7011/Advanced-ChaoXingBot Adapter（图片题专精）",
+  "kind": "subprocess",
+  "enabled": false,
+  "priority": 20,
+  "upstream": {
+    "repo": "https://github.com/nothing-7011/Advanced-ChaoXingBot",
+    "path": "upstreams/Advanced-ChaoXingBot",
+    "pinned_commit": null,
+    "license": "GPL-3.0",
+    "isolation": "process",
+    "note": "GPL-3.0 fork：只允许 subprocess。存在意义唯一且明确 —— 它是生态里唯一的图片题（读图）实现。"
+  },
+  "runtime": {
+    "language": "python",
+    "version": ">=3.13",
+    "install": "pip install -r requirements.txt",
+    "entry": "python main.py -c {account_workdir}/config.ini"
+  },
+  "capabilities": {
+    "C01": { "level": "full", "params": ["phone", "password"] },
+    "C02": { "level": "partial" },
+    "C12": { "level": "full" },
+    "C13": { "level": "full" },
+    "C14": { "level": "full" },
+    "C16": { "level": "full", "module": "api/live.py" },
+    "C18": { "level": "full" },
+    "C19": { "level": "full", "params": ["notopen_action"], "enum": ["retry", "ask", "continue"] },
+    "C20": { "level": "full", "params": ["speed"], "max": 2 },
+    "C22": { "level": "full" },
+    "C24": { "level": "full", "note": "agents/parser_agent.py + agents/solver_agent.py 双 Agent 读图解题" },
+    "C25": { "level": "full" },
+    "C26": { "level": "full" },
+    "C32": { "level": "partial" },
+    "C34": { "level": "full" },
+    "C39": { "level": "full" },
+    "C44": { "level": "partial", "note": "支持双 AI 协议，可作为 Agent 答题的备选注入点" },
+    "C46": { "level": "full" }
+  },
+  "health": {
+    "probe": { "capability": "C06", "method": "invoke", "args": { "dry_run": true }, "timeout_ms": 45000 },
+    "degrade_on": ["platform_changed"]
+  },
+  "limits": { "max_concurrency": 1, "min_interval_ms": 1500 }
+}

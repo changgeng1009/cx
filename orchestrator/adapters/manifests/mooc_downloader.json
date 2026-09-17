@@ -1,0 +1,40 @@
+{
+  "id": "mooc-downloader",
+  "name": "PyJun/Mooc_Downloader Adapter（资源下载）",
+  "kind": "subprocess",
+  "enabled": false,
+  "priority": 30,
+  "upstream": {
+    "repo": "https://github.com/PyJun/Mooc_Downloader",
+    "path": "upstreams/Mooc_Downloader",
+    "pinned_commit": null,
+    "license": "none",
+    "isolation": "process",
+    "note": "无许可证 = 默认保留所有权利。仅作独立程序调用，禁止复制代码。生态里活跃度最高的项目（2026-09-16 仍在推送）。"
+  },
+  "runtime": {
+    "language": "python",
+    "version": ">=3.10",
+    "install": "pip install -r requirements.txt",
+    "entry": "python -m mooc_downloader"
+  },
+  "capabilities": {
+    "C01": { "level": "full" },
+    "C02": { "level": "partial" },
+    "C06": { "level": "full" },
+    "C08": { "level": "full" },
+    "C09": { "level": "partial" },
+    "C10": { "level": "partial" },
+    "C12": { "level": "partial", "note": "可下载而非完成" },
+    "C13": { "level": "partial" },
+    "C14": { "level": "partial" },
+    "C15": { "level": "partial" },
+    "C32": { "level": "full", "note": "视频与课件同时下载，支持 30+ 平台" },
+    "C34": { "level": "full" }
+  },
+  "health": {
+    "probe": { "capability": "C06", "method": "invoke", "args": { "dry_run": true }, "timeout_ms": 30000 },
+    "degrade_on": ["platform_changed"]
+  },
+  "limits": { "max_concurrency": 1, "min_interval_ms": 1500 }
+}

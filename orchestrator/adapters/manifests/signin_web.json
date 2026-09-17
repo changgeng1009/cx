@@ -1,0 +1,33 @@
+{
+  "id": "signin-web",
+  "name": "签到 Adapter（基于 chaoxing-sign-app / XBT，待评估）",
+  "kind": "subprocess",
+  "enabled": false,
+  "priority": 40,
+  "upstream": {
+    "repo": "https://github.com/eric-gitta-moore/chaoxing-sign-app",
+    "path": "upstreams/chaoxing-sign-app",
+    "pinned_commit": null,
+    "license": "GPL-3.0",
+    "isolation": "process",
+    "note": "候选三选一：chaoxing-sign-app(532★,GPL-3.0) / ChaoxingSignFaker(489★,AGPL-3.0) / XBT(124★,GPL-3.0)。全部是浏览器/App 类，且 ChaoxingSignFaker 为 AGPL（传染性最强），必须严格进程隔离。M6 阶段先评估自建最小签到（普通签到通常只是几个 HTTP 请求）是否更省成本。"
+  },
+  "runtime": {
+    "language": "typescript",
+    "version": ">=20",
+    "install": "npm ci",
+    "entry": "(待定，M6 评估)"
+  },
+  "capabilities": {
+    "C48": { "level": "full" },
+    "C49": { "level": "full", "note": "位置/二维码/手势/拍照/签到码，各候选项目覆盖不同" },
+    "C50": { "level": "partial", "note": "监测能力需自建轮询循环" },
+    "C51": { "level": "partial" },
+    "C38": { "level": "full", "note": "依赖浏览器自动化，这是它最大的成本来源" }
+  },
+  "health": {
+    "probe": { "capability": "C48", "method": "invoke", "args": { "dry_run": true }, "timeout_ms": 60000 },
+    "degrade_on": ["platform_changed"]
+  },
+  "limits": { "max_concurrency": 1, "min_interval_ms": 3000 }
+}
