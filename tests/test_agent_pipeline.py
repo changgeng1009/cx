@@ -16,7 +16,12 @@ import unittest
 import urllib.error
 import urllib.request
 
-from orchestrator.answer_broker import AnswerBroker, extract_questions, parse_answers
+from orchestrator.answer_broker import (
+    AnswerBroker,
+    extract_questions,
+    normalize_answers,
+    parse_answers,
+)
 from orchestrator.fixtures import make_upstream_question_prompt
 from orchestrator.models import TicketState
 from orchestrator.openai_shim import config_snippet, extract_prompt, start_in_thread
@@ -98,7 +103,10 @@ class AnswerBrokerTests(unittest.TestCase):
 
             answered = broker.submit(ticket.ticket_id, ["A", "正确", "A"])
             self.assertEqual(answered.state, TicketState.ANSWERED)
-            self.assertEqual(answered.answers, ["A", "正确", "A"])
+            # M5 安全网：字母答案落库前已转成选项原文（A1 靠文本匹配定位选项）
+            self.assertEqual(
+                answered.answers, ["悬空相当于高电平", "正确", "A(B+C)"]
+            )
             self.assertEqual(answered.answered_by, "agent")
             self.assertEqual(broker.pending(), [])
 
@@ -139,15 +147,18 @@ class AnswerBrokerTests(unittest.TestCase):
             self.assertEqual(restarted.get(ticket.ticket_id).state, TicketState.ANSWERED)
 
     def test_to_openai_response_shape(self) -> None:
+        """响应必须是 A1 能解析的 JSON（按 A1 api/answer.py 的解析路径验证）。"""
         with Sandbox() as sandbox:
             broker = sandbox.ctx.broker
-            ticket = broker.create_ticket("1. 题目\nA. 甲")
-            broker.submit(ticket.ticket_id, ["A", "B"])
+            ticket = broker.create_ticket("1. 题目\nA. 甲\nB. 乙")
+            broker.submit(ticket.ticket_id, ["A"])
             response = broker.to_openai_response(broker.get(ticket.ticket_id))
             self.assertEqual(response["object"], "chat.completion")
-            self.assertEqual(
-                response["choices"][0]["message"]["content"], "A\nB"
-            )
+            content = response["choices"][0]["message"]["content"]
+            # 复刻 A1 的解析：json.loads(去 md 包裹) → ["Answer"] → "\n".join
+            parsed = json.loads(content)
+            self.assertEqual(parsed, {"Answer": ["甲"]})
+            self.assertEqual("\n".join(parsed["Answer"]), "甲")
             self.assertIn("usage", response)
 
     def test_timeout_response_is_degraded_not_crash(self) -> None:
@@ -174,7 +185,11 @@ class AnswerCommandTests(unittest.TestCase):
                 "answer_submit", ticket_id=ticket.ticket_id, answers="A\n正确\nA"
             )
             self.assertTrue(submitted.ok)
-            self.assertEqual(submitted.data["ticket"]["answers"], ["A", "正确", "A"])
+            # 字母已按选项原文规范化（见 normalize_answers）
+            self.assertEqual(
+                submitted.data["ticket"]["answers"],
+                ["悬空相当于高电平", "正确", "A(B+C)"],
+            )
 
             stats = sandbox.run("answer_stats")
             self.assertEqual(stats.data["answered"], 1)
@@ -251,8 +266,14 @@ class ShimEndToEndTests(unittest.TestCase):
                 caller.join(timeout=20)
                 self.assertIn("body", captured)
                 body = captured["body"]
+                # 按 A1 的解析路径校验（json → Answer → 换行拼接）
+                parsed = json.loads(body["choices"][0]["message"]["content"])
                 self.assertEqual(
-                    body["choices"][0]["message"]["content"], "A\nA\nA"
+                    parsed,
+                    {"Answer": ["悬空相当于高电平", "正确", "A(B+C)"]},
+                )
+                self.assertEqual(
+                    "\n".join(parsed["Answer"]), "悬空相当于高电平\n正确\nA(B+C)"
                 )
             finally:
                 server.shutdown()
@@ -398,6 +419,136 @@ class McpServerTests(unittest.TestCase):
             lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
             self.assertEqual(len(lines), 2)
             self.assertEqual(json.loads(lines[0])["result"]["serverInfo"]["name"], "chaoxing-orchestrator")
+
+
+class StaleTicketTests(unittest.TestCase):
+    """历史残留工单必须可清理，否则会污染 answer_pending（实测踩过）。"""
+
+    def test_expire_stale_marks_and_hides(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            stale = broker.create_ticket("1. 旧题\nA. 甲")
+            fresh = broker.create_ticket("1. 新题\nA. 乙")
+            # 把旧工单的创建时间推早 1 小时（远超其默认 120s 等待上限）
+            from datetime import datetime, timedelta
+
+            ticket = broker.get(stale.ticket_id)
+            ticket.created_at = (datetime.now().astimezone() - timedelta(hours=1)).isoformat(
+                timespec="milliseconds"
+            )
+            broker._pending_path(stale.ticket_id).write_text(
+                json.dumps(ticket.to_dict(), ensure_ascii=False), encoding="utf-8"
+            )
+
+            expired = broker.expire_stale()
+            self.assertEqual(expired, [stale.ticket_id])
+
+            remaining = [t.ticket_id for t in broker.pending()]
+            self.assertIn(fresh.ticket_id, remaining)
+            self.assertNotIn(stale.ticket_id, remaining)
+
+            stats = broker.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["timeout"], 1)
+
+    def test_answered_ticket_never_expired(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            ticket = broker.create_ticket("1. 题\nA. 甲")
+            broker.submit(ticket.ticket_id, ["甲"])
+            self.assertEqual(broker.expire_stale(reference_ts=time.time() + 3600), [])
+
+    def test_expire_within_limit_keeps_pending(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            ticket = broker.create_ticket("1. 题\nA. 甲")
+            self.assertEqual(broker.expire_stale(), [])
+            self.assertIn(ticket.ticket_id, [t.ticket_id for t in broker.pending()])
+
+
+class A1ProviderFormatTests(unittest.TestCase):
+    """M5：对齐 A1 `AI` provider 的真实发题/收答格式（实测校准）。"""
+
+    #: A1 的 user 消息原文形态（选项字母已被上游剥掉）
+    A1_PROMPT = (
+        "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，"
+        "示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。"
+        "\n题目：建筑火灾烟气的主要危害是什么？"
+        "\n选项：造成人员窒息死亡"
+        "\n影响安全疏散"
+        "\n使消防员难以接近火源"
+    )
+
+    def test_parses_a1_prompt_into_structured_question(self) -> None:
+        questions = extract_questions(self.A1_PROMPT)
+        self.assertEqual(len(questions), 1)
+        q = questions[0]
+        self.assertIn("建筑火灾烟气", q.stem)
+        self.assertEqual([o["key"] for o in q.options], ["A", "B", "C"])
+        self.assertEqual(q.options[0]["text"], "造成人员窒息死亡")
+
+    def test_letter_answer_is_converted_to_option_text(self) -> None:
+        """字母答案必须转成选项原文——A1 用文本子序列匹配选项。"""
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            ticket = broker.create_ticket(self.A1_PROMPT)
+            self.assertEqual(len(ticket.questions), 1)
+            broker.submit(ticket.ticket_id, ["B"])
+            answered = broker.get(ticket.ticket_id)
+            self.assertEqual(answered.answers, ["影响安全疏散"])
+
+    def test_multi_letter_answer_becomes_newline_joined_text(self) -> None:
+        prompt = (
+            "本题为多选题，你必须选择两个或以上选项。\n"
+            "题目：属于防烟设施的有？\n"
+            "选项：加压送风机\n机械加压送风管道\n排烟风机\n送风口"
+        )
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            ticket = broker.create_ticket(prompt)
+            broker.submit(ticket.ticket_id, ["AB"])
+            answered = broker.get(ticket.ticket_id)
+            self.assertEqual(answered.answers, ["加压送风机\n机械加压送风管道"])
+
+    def test_judgement_and_text_answers_untouched(self) -> None:
+        prompt = "本题为判断题。\n题目：防烟楼梯间应设置防烟设施。\n选项：正确\n错误"
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            t1 = broker.create_ticket(prompt)
+            broker.submit(t1.ticket_id, ["正确"])
+            self.assertEqual(broker.get(t1.ticket_id).answers, ["正确"])
+        # 长文本答案不会被字母规则误伤
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            t2 = broker.create_ticket(self.A1_PROMPT)
+            broker.submit(t2.ticket_id, ["影响安全疏散"])
+            self.assertEqual(broker.get(t2.ticket_id).answers, ["影响安全疏散"])
+
+    def test_full_loop_matches_a1_option_lookup(self) -> None:
+        """端到端：Agent 答字母 → shim 回 JSON → 模拟 A1 的选项定位必须命中。"""
+        # 真实 A1 的 options 自带字母前缀（o[:1] 取到的才是选项字母）
+        option_texts = [
+            "A. 造成人员窒息死亡",
+            "B. 影响安全疏散",
+            "C. 使消防员难以接近火源",
+        ]
+
+        def is_subsequence(needle: str, haystack: str) -> bool:
+            it = iter(haystack)
+            return all(ch in it for ch in needle)
+
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            ticket = broker.create_ticket(self.A1_PROMPT)
+            broker.submit(ticket.ticket_id, ["B"])
+            response = broker.to_openai_response(broker.get(ticket.ticket_id))
+            content = response["choices"][0]["message"]["content"]
+            a1_answer = "\n".join(json.loads(content)["Answer"])
+
+            matched = next(
+                (o[:1] for o in option_texts if is_subsequence(a1_answer, o)), None
+            )
+            self.assertEqual(matched, "B")
 
 
 if __name__ == "__main__":

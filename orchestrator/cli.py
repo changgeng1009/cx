@@ -107,6 +107,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--speed", type=float, default=None)
         p.add_argument("--dry-run", action="store_true", help="只预览不写")
         p.add_argument("--confirm", action="store_true", help="确认真实写操作")
+        p.add_argument(
+            "--allow-work",
+            action="store_true",
+            help="M5：处理章节检测(quiz)，题目交操控 Agent 作答（默认 submit=false 不交卷）",
+        )
+        p.add_argument(
+            "--submit-answers",
+            action="store_true",
+            help="M5：答完后正式提交章节检测（默认只作答不提交；提交不可逆，慎用）",
+        )
     p = add("run_chapter", "只跑指定章节")
     p.add_argument("--course-id", required=True)
     p.add_argument("--chapter-id", required=True)
@@ -114,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--speed", type=float, default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--confirm", action="store_true")
+    p.add_argument(
+        "--allow-work",
+        action="store_true",
+        help="M5：处理章节检测(quiz)，题目交操控 Agent 作答（默认 submit=false 不交卷）",
+    )
+    p.add_argument(
+        "--submit-answers",
+        action="store_true",
+        help="M5：答完后正式提交章节检测（默认只作答不提交；提交不可逆，慎用）",
+    )
 
     # ---- 控制 ----
     p = add("status", "查询任务状态")
@@ -147,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--answers", required=True, help="换行/分号分隔，或 JSON 数组")
     p.add_argument("--answered-by", default="agent")
     add("answer_stats", "工单队列统计")
+    p = add("answer_clean", "把超时未答的历史工单标记为过期（不再出现在 answer_pending）")
+    p.add_argument(
+        "--older-than",
+        type=float,
+        default=0.0,
+        help="额外宽限秒数（默认 0：超过该工单自身等待上限即视为过期）",
+    )
     p = add("shim_config", "输出上游需要的 config.ini 片段")
     p.add_argument("--port", type=int, default=8765)
 
@@ -203,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--api-key", default="local-agent")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="单个工单等待操控 Agent 应答的秒数（超时按'上游没搜到'降级处理）",
+    )
 
     return parser
 
@@ -374,9 +407,13 @@ def _render_data(command: str, data: dict[str, Any]) -> list[str]:
 
     if command == "get_homework":
         for row in data.get("deadlines") or []:
+            due = row.get("due_at")
+            suffix = f"  截止 {due}" if due else ""
+            # 单课作业列表（fetch_homework）不返回截止时间，只有总览才有
+            status = row.get("status")
+            suffix += f"  [{status}]" if status else ""
             out.append(
-                f"  - [{row.get('course_id')}#{row.get('index')}] {row.get('title')} "
-                f"截止 {row.get('due_at')}"
+                f"  - [{row.get('course_id')}#{row.get('index')}] {row.get('title')}{suffix}"
             )
         if not data.get("deadlines"):
             out.append("  （无未交作业）")
@@ -420,6 +457,16 @@ def _render_data(command: str, data: dict[str, Any]) -> list[str]:
             out.append(f"{indent}- {ch.get('index')}  {ch.get('name')}{mark}")
         if not data.get("chapters"):
             out.append("  （该课程没有返回章节，可能未开放章节功能）")
+        return out
+
+    if command == "answer_clean":
+        expired = data.get("expired") or []
+        for ticket_id in expired:
+            out.append(f"  - {ticket_id}  已标记过期")
+        if not expired:
+            out.append("  （没有超时未答的工单，无需清理）")
+        else:
+            out.append(f"  共清理 {len(expired)} 个历史工单")
         return out
 
     if command == "answer_pending":
@@ -579,6 +626,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"本地 OpenAI 兼容代理已启动：http://{args.host}:{args.port}/v1\n"
             f"把上游 config.ini 的 endpoint 指到这里即可（key={args.api_key}）",
+            file=sys.stderr,
+            flush=True,
+        )
+        ctx.broker.timeout_s = float(args.timeout)
+        print(
+            f"工单等待上限：{args.timeout:.0f}s（超时上游按'未搜到'跳过该题）",
             file=sys.stderr,
             flush=True,
         )

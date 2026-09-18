@@ -416,6 +416,12 @@ class XuexitongMcpAdapter(Adapter):
         if capability_id == "C07":
             op = "fetch_course_meta" if params.get("course_id") else "fetch_profile"
             args = {"course_id": params.get("course_id")}
+        # C29 语义分叉：带 course_id → 该课作业列表；不带 → 全部课程截止总览。
+        # （此前恒走 overview，于是 `get_homework --course-id X` 会返回所有课程，
+        #   course_id 形同虚设 —— 实跑时踩到，读者会以为过滤生效了）
+        elif capability_id == "C29" and params.get("course_id"):
+            op = "fetch_homework"
+            args = {"course_id": params.get("course_id")}
         else:
             op = _OP_MAP[capability_id]
             args = self._args_for(op, params)

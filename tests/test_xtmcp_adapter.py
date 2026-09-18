@@ -36,6 +36,9 @@ FAKE_WORKER = textwrap.dedent(
     """
     import json, sys, os
     req = json.loads(sys.stdin.read())
+    cap = os.environ.get("FAKE_CAPTURE")
+    if cap:
+        open(cap, "w", encoding="utf-8").write(json.dumps(req, ensure_ascii=False))
     op = req["op"]
     mode = os.environ.get("FAKE_MODE", "ok")
     if op == "ping":
@@ -199,6 +202,29 @@ class AdapterTestCase(unittest.TestCase):
         self.assertIn("xuexitong-mcp", ids)
         self.assertIn("mock", ids)
         self.assertEqual(ids[0], "xuexitong-mcp", ids)
+
+
+class C29RoutingTests(AdapterTestCase):
+    """C29 语义分叉：带 course_id → 该课作业；不带 → 全部课程截止总览。"""
+
+    def _capture(self, params: dict) -> dict:
+        cap = self.base / "cap.json"
+        os.environ["FAKE_CAPTURE"] = str(cap)
+        try:
+            result = self.adapter.invoke("C29", params, self.ctx)
+            self.assertTrue(result.ok, result.error)
+        finally:
+            os.environ.pop("FAKE_CAPTURE", None)
+        return json.loads(cap.read_text(encoding="utf-8"))
+
+    def test_with_course_id_routes_to_per_course_homework(self) -> None:
+        req = self._capture({"course_id": "267147955"})
+        self.assertEqual(req["op"], "fetch_homework")
+        self.assertEqual(req["args"]["course_id"], "267147955")
+
+    def test_without_course_id_falls_back_to_overview(self) -> None:
+        req = self._capture({})
+        self.assertEqual(req["op"], "fetch_deadline_overview")
 
 
 if __name__ == "__main__":

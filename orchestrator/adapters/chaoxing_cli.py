@@ -16,6 +16,7 @@ worker 的 cwd 固定在账号工作区的 `upstream/chaoxing/`）。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -148,15 +149,25 @@ class ChaoxingCliAdapter(Adapter):
     ) -> tuple[int, dict[str, Any], list[str]]:
         """长任务（run）：流式读事件 → ctx.report；取消/暂停在任务点边界生效。"""
         self.ensure_bridge(account_id)
+        # 上游的 loguru/tqdm/验证码提示全走 stderr——必须落盘，
+        # 否则任务卡住时没有任何诊断依据（实测教训：视频上报卡死半小时无迹可寻）
+        err_log = self.root / "runs" / f"{ctx.request_id}.worker.err.log"
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        err_fh = open(err_log, "w", encoding="utf-8", errors="replace")
+        # 上游用 loguru 往 stderr 打中文：必须显式指定 UTF-8，
+        # 否则 Windows 控制台代码页（GBK）会让日志变成乱码（实测）
+        child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         proc = subprocess.Popen(  # noqa: S603
             [str(self.python_exe), str(self.worker_path)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=err_fh,
             text=True,
             encoding="utf-8",
             cwd=str(self.config_dir(account_id)),
+            env=child_env,
         )
+        err_fh.close()  # Popen 持有句柄，父进程侧可关
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(json.dumps(self._base_payload(op, args), ensure_ascii=False) + "\n")
         proc.stdin.flush()
@@ -281,7 +292,15 @@ class ChaoxingCliAdapter(Adapter):
         }
         if op == "run":
             args["chapter_id"] = str(params.get("chapter_id") or "")
+            # quiz（章节检测）默认跳过；显式开启时才注入答题链路。
+            # 开启 allow_work 必须同时注入 tiku，否则上游 study_work 无题可答。
             args["allow_work"] = bool(params.get("allow_work"))
+            args["tiku_enabled"] = bool(params.get("allow_work"))
+            args["shim_endpoint"] = str(
+                params.get("shim_endpoint") or "http://127.0.0.1:8765/v1"
+            )
+            # 默认不交卷（安全默认）：答完只在平台侧保存，由使用者决定是否正式提交
+            args["tiku_submit"] = "true" if params.get("submit_answers") else "false"
 
         self._throttle()
 

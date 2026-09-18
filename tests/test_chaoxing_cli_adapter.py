@@ -31,6 +31,9 @@ FAKE_WORKER = textwrap.dedent(
     """
     import json, sys, os
     req = json.loads(sys.stdin.readline())
+    cap = os.environ.get("FAKE_CAPTURE")
+    if cap:
+        open(cap, "w", encoding="utf-8").write(json.dumps(req, ensure_ascii=False))
     op = req["op"]
     mode = os.environ.get("FAKE_MODE", "ok")
 
@@ -81,6 +84,39 @@ FAKE_WORKER = textwrap.dedent(
     sys.exit(0)
     """
 )
+
+
+class QuizRecheckTests(unittest.TestCase):
+    """M5 假失败兜底：quiz 报错后复扫平台，任务点消失即视为已完成。"""
+
+    class _Client:
+        def __init__(self, jobs=None, boom=False):
+            self._jobs = jobs or []
+            self._boom = boom
+
+        def get_job_list(self, course, point):
+            if self._boom:
+                raise RuntimeError("网络抖动")
+            return self._jobs, {}
+
+    def setUp(self) -> None:
+        from orchestrator.adapters.cxcli_worker import job_still_pending
+
+        self.fn = job_still_pending
+        self.course = {"courseId": "1"}
+        self.point = {"id": "ch_1"}
+
+    def test_job_absent_means_finished(self) -> None:
+        client = self._Client(jobs=[{"jobid": "other"}])
+        self.assertFalse(self.fn(client, self.course, self.point, "work-abc"))
+
+    def test_job_present_means_still_pending(self) -> None:
+        client = self._Client(jobs=[{"jobid": "work-abc"}])
+        self.assertTrue(self.fn(client, self.course, self.point, "work-abc"))
+
+    def test_query_failure_is_conservative(self) -> None:
+        client = self._Client(boom=True)
+        self.assertTrue(self.fn(client, self.course, self.point, "work-abc"))
 
 
 class ChaoxingCliTestCase(unittest.TestCase):
@@ -194,6 +230,118 @@ class ChaoxingCliTestCase(unittest.TestCase):
         self.assertFalse(self.adapter.invoke("C06", {}, self.ctx).ok)
 
     # ------------------------------------------------------------------
+    def _capture_invoke(self, params: dict) -> dict:
+        """跑一次 invoke，返回假 worker 实际收到的请求体。"""
+        cap = self.base / "captured.json"
+        os.environ["FAKE_CAPTURE"] = str(cap)
+        try:
+            result = self.adapter.invoke("C18", {"course_id": "123", **params}, self.ctx)
+            self.assertTrue(result.ok, result.error)
+        finally:
+            os.environ.pop("FAKE_CAPTURE", None)
+        return json.loads(cap.read_text(encoding="utf-8"))
+
+    def test_allow_work_enables_tiku_and_shim(self) -> None:
+        """M5 接线：--allow-work 必须同时打开 tiku 并给出 shim 地址。"""
+        captured = self._capture_invoke({"allow_work": True})
+        args = captured["args"]
+        self.assertTrue(args["allow_work"])
+        self.assertTrue(args["tiku_enabled"])
+        self.assertEqual(args["shim_endpoint"], "http://127.0.0.1:8765/v1")
+        # 安全默认：不交卷
+        self.assertEqual(args["tiku_submit"], "false")
+
+    def test_allow_work_off_by_default(self) -> None:
+        args = self._capture_invoke({})["args"]
+        self.assertFalse(args["allow_work"])
+        self.assertFalse(args["tiku_enabled"])
+
+    def test_submit_answers_flag_propagates(self) -> None:
+        args = self._capture_invoke({"allow_work": True, "submit_answers": True})["args"]
+        self.assertEqual(args["tiku_submit"], "true")
+
+    def test_shim_endpoint_override(self) -> None:
+        args = self._capture_invoke(
+            {"allow_work": True, "shim_endpoint": "http://127.0.0.1:9999/v1"}
+        )["args"]
+        self.assertEqual(args["shim_endpoint"], "http://127.0.0.1:9999/v1")
+
+    # ------------------------------------------------------------------
+    def test_build_tiku_against_real_upstream(self) -> None:
+        """用真实上游构造 AI provider —— 证明 M5 接线在上游侧成立。
+
+        需要 .venv（含 openai 等依赖）与 upstreams/chaoxing；缺一则跳过。
+        """
+        from orchestrator.adapters.cxcli_worker import build_tiku
+
+        upstream = ROOT / "upstreams" / "chaoxing"
+        if not (upstream / "api" / "answer.py").is_file():
+            self.skipTest("上游未 clone")
+        try:
+            tiku = build_tiku(str(upstream), "http://127.0.0.1:8765/v1", submit=False)
+        except ImportError as exc:
+            self.skipTest(f"上游依赖缺失：{exc}")
+
+        from api.answer import AI
+
+        self.assertIsInstance(tiku, AI)
+        self.assertEqual(tiku.endpoint, "http://127.0.0.1:8765/v1")
+        self.assertEqual(tiku.model, "agent-in-the-loop")
+        self.assertFalse(tiku.SUBMIT)
+
+    def test_build_tiku_submit_true(self) -> None:
+        from orchestrator.adapters.cxcli_worker import build_tiku
+
+        upstream = ROOT / "upstreams" / "chaoxing"
+        if not (upstream / "api" / "answer.py").is_file():
+            self.skipTest("上游未 clone")
+        try:
+            tiku = build_tiku(str(upstream), "http://127.0.0.1:8765/v1", submit=True)
+        except ImportError as exc:
+            self.skipTest(f"上游依赖缺失：{exc}")
+        self.assertTrue(tiku.SUBMIT)
+
+    def test_upstream_env_fixes_font_table_path(self) -> None:
+        """字体反爬映射表必须可加载（相对 CWD 加载会失败 → 题目变乱码）。"""
+        from orchestrator.adapters.cxcli_worker import prepare_upstream_env
+
+        upstream = ROOT / "upstreams" / "chaoxing"
+        table = upstream / "resource" / "font_map_table.json"
+        if not table.is_file():
+            self.skipTest("上游资源未 clone")
+        prepare_upstream_env(str(upstream))
+        from api.cxsecret_font import fonthash_dao, resource_path
+
+        resolved = Path(resource_path("resource/font_map_table.json"))
+        self.assertTrue(resolved.is_file(), f"字体表路径未指向上游：{resolved}")
+        self.assertEqual(resolved.resolve(), table.resolve())
+        # 单例已加载出真实映射（不是空表兜底）
+        self.assertGreater(len(fonthash_dao.char_map), 1000)
+
+    def test_build_tiku_bypasses_local_proxy(self) -> None:
+        """本地 shim 必须绕过系统代理（httpx 默认 trust_env，会 502）。"""
+        from orchestrator.adapters.cxcli_worker import build_tiku
+
+        upstream = ROOT / "upstreams" / "chaoxing"
+        if not (upstream / "api" / "answer.py").is_file():
+            self.skipTest("上游未 clone")
+        saved = {k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
+        os.environ.pop("NO_PROXY", None)
+        os.environ.pop("no_proxy", None)
+        try:
+            try:
+                build_tiku(str(upstream), "http://127.0.0.1:8765/v1", submit=False)
+            except ImportError as exc:
+                self.skipTest(f"上游依赖缺失：{exc}")
+            self.assertIn("127.0.0.1", os.environ.get("NO_PROXY", ""))
+            self.assertIn("localhost", os.environ.get("no_proxy", ""))
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_manifest_gpl_pinned_and_enabled(self) -> None:
         m = _manifest()
         self.assertTrue(m.enabled)

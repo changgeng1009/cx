@@ -99,6 +99,9 @@ COMMANDS: dict[str, CommandSpec] = {
     "answer_pending": CommandSpec("answer_pending", "C43", "agent", "取出待答工单"),
     "answer_submit": CommandSpec("answer_submit", "C44", "agent", "回填 Agent 答案"),
     "answer_stats": CommandSpec("answer_stats", None, "agent", "工单队列统计"),
+    "answer_clean": CommandSpec(
+        "answer_clean", None, "agent", "把超时未答的历史工单标记为过期"
+    ),
     "shim_config": CommandSpec("shim_config", "C46", "agent", "输出上游所需配置片段"),
     # 签到
     "sign_in": CommandSpec("sign_in", "C48", "sign", "执行签到", True),
@@ -815,6 +818,23 @@ class Orchestrator:
             return self._finish(
                 request_id, command, account_id, started, logger, ok=True,
                 state=TaskState.COMPLETED, data=self.broker.stats(),
+            )
+
+        if command == "answer_clean":
+            expired = self.broker.expire_stale(
+                margin_s=float(params.get("older_than") or 0.0)
+            )
+            return self._finish(
+                request_id, command, account_id, started, logger, ok=True,
+                state=TaskState.COMPLETED,
+                data={
+                    "expired": expired,
+                    "count": len(expired),
+                    "note": (
+                        "已标记为过期，不再出现在 answer_pending 里；"
+                        "工单文件保留在 runs/answer/pending/"
+                    ),
+                },
             )
 
         if command == "answer_pending":

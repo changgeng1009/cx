@@ -18,6 +18,7 @@ GPL 上游——这是进程边界方案本身。上游的答题/刷课业务逻
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 
@@ -71,18 +72,73 @@ class ControlFlag:
                 return
 
 
-def build_client(upstream_path: str):
+def prepare_upstream_env(upstream_path: str) -> None:
+    """把上游的资源基准指到上游目录（字体反爬映射表必需）。
+
+    上游 `api/cxsecret_font.resource_path()` 的基准是 `sys._MEIPASS`（PyInstaller
+    兼容钩子），未打包时退化为 `os.path.abspath(".")` 即**当前工作目录**。
+    我们的 worker 为了 cookie 桥接把 CWD 固定在账号工作区，因此上游会找不到
+    `resource/font_map_table.json`（1.5MB 字体哈希表）→ 字体反爬解不开 →
+    **题目正文变成乱码字**（实测：整道题不可读，M5 直接失效）。
+
+    这里复用上游自带的 `_MEIPASS` 钩子：不 chdir（cookie 相对路径不受影响）、
+    不改上游一行代码，只是把基准指回上游目录。
+    """
+    upstream = os.path.abspath(upstream_path)
+    if upstream not in sys.path:
+        sys.path.insert(0, upstream)
+    sys._MEIPASS = upstream  # type: ignore[attr-defined]
+
+
+def build_tiku(upstream_path: str, shim_endpoint: str, submit: bool = False) -> Any:
+    """构造 A1 的 AI 题库 provider，把题目请求引到本地 shim。
+
+    M5 的关键接线：A1 以为自己在问大模型，实际 endpoint 指向统一层的
+    `openai_shim`（127.0.0.1:8765/v1），题目被转成待答工单交给操控 Agent。
+
+    配置键按 A1 `AI._init_tiku` 的读取项给全，缺键会 KeyError。
+    submit=False（默认）：答完**不自动交卷**，由使用者显式开启 ——
+    章节检测提交不可逆，默认值必须偏保守。
+    """
+    prepare_upstream_env(upstream_path)
+    # 本地 shim 绝不能被系统代理劫持：A1 用 openai SDK（httpx）且默认
+    # trust_env=True，会把发往 127.0.0.1 的请求也交给 HTTP_PROXY
+    # （实测表现：HTTP 502 Bad Gateway，整条答题链路静默失效）。
+    os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
+    from api.answer import Tiku  # noqa: PLC0415 —— 子进程内动态加载上游
+
+    conf = {
+        "provider": "AI",
+        "endpoint": shim_endpoint,
+        "key": "local-agent",
+        "model": "agent-in-the-loop",
+        "http_proxy": "",
+        "min_interval_seconds": "0",
+        "check_llm_connection": "false",
+        "submit": "true" if submit else "false",
+        "cover_rate": "0.9",
+        "true_list": "正确,对,√,是",
+        "false_list": "错误,错,×,否,不对,不正确",
+    }
+    tiku = Tiku.get_tiku_from_config(config=conf)
+    tiku.init_tiku()
+    return tiku
+
+
+def build_client(upstream_path: str, tiku: Any = None):
     """绕开上游 main.init_chaoxing（带交互/题库），直接构造客户端。
 
-    tiku=None：M2 阶段不支持自动答题（quiz 任务点被编排层跳过），
-    M5 接入 openai_shim 后由统一层注入 tiku 配置。
+    tiku=None：不启用答题（M2 默认，quiz 任务点被编排层跳过）；
+    M5 起由 build_tiku() 注入 AI provider，把题目转给本地 shim。
     """
-    sys.path.insert(0, upstream_path)
+    prepare_upstream_env(upstream_path)
     try:
         from api.base import Account, Chaoxing  # noqa: PLC0415 —— 子进程内动态加载
     except ImportError:
         return None
-    return Chaoxing(Account("", ""), tiku=None)
+    return Chaoxing(Account("", ""), tiku=tiku)
 
 
 def job_type_of(job: dict) -> str:
@@ -122,6 +178,26 @@ def find_course(client, course_id: str) -> dict | None:
         if str(c.get("courseId")) == raw:
             return c
     return None
+
+
+def job_still_pending(client, course: dict, raw_point: dict, job_id: str) -> bool:
+    """复扫该章节任务点，判断目标任务点是否仍待完成（**以平台为准**）。
+
+    用途（M5 实测）：章节检测交卷成功后，若未满分，上游会"带反馈重做"，
+    而重做取题页解析不出来（上游限制）→ 最终返回 StudyResult.ERROR。此时
+    worker 汇总会写成 failed，但**平台侧该任务点其实已完成**。这里复扫一次
+    消除这个假失败。
+
+    查询本身失败时保守返回 True（宁可报失败，也不虚报成功）。
+    """
+    try:
+        jobs, _ = client.get_job_list(course, raw_point)
+    except Exception:  # noqa: BLE001 —— 复扫失败不该影响主流程
+        return True
+    for job in jobs or []:
+        if str(job.get("jobid") or "") == job_id:
+            return True
+    return False
 
 
 def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
@@ -212,6 +288,13 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
                 result = cxmain.process_job(client, course, job, job_info, speed)
                 ok = (result == cxmain.StudyResult.SUCCESS)
             except Exception as exc:  # noqa: BLE001 —— 单任务点失败不拖垮整课
+                if jtype == "quiz" and not job_still_pending(
+                    client, course, raw_point, job_id
+                ):
+                    _emit({"event": "job_recheck", "task_point_id": job_id, "type": jtype,
+                           "note": "上游抛异常，复扫平台确认已完成"})
+                    completed.append(job_id)
+                    continue
                 _emit({"event": "job_done", "task_point_id": job_id, "type": jtype,
                        "result": "ERROR", "error": f"{type(exc).__name__}: {exc}"})
                 failed.append({"id": job_id, "type": jtype, "result": "ERROR"})
@@ -229,6 +312,14 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
             _emit({"event": "job_done", "task_point_id": job_id, "type": jtype,
                    "result": "SUCCESS" if ok else str(result)})
             if ok:
+                completed.append(job_id)
+            elif jtype == "quiz" and not job_still_pending(
+                client, course, raw_point, job_id
+            ):
+                # 假失败消除：上游报错（典型是交卷成功后"重做取题失败"），
+                # 但平台侧任务点已从待完成列表消失 —— 按已完成计
+                _emit({"event": "job_recheck", "task_point_id": job_id, "type": jtype,
+                       "note": "上游报失败，复扫平台确认已完成（M5 交卷成功后重做取题失败的已知情况）"})
                 completed.append(job_id)
             else:
                 failed.append({"id": job_id, "type": jtype, "result": str(result)})
@@ -287,7 +378,21 @@ def main() -> int:
     if not upstream_path:
         return _fail("BAD_REQUEST", "缺少 upstream_path", EXIT_INTERNAL)
 
-    client = build_client(upstream_path)
+    client = None
+    if args.get("tiku_enabled"):
+        # 答题链路：题目经本地 shim → 工单 → 操控 Agent
+        try:
+            tiku = build_tiku(
+                upstream_path,
+                str(args.get("shim_endpoint") or ""),
+                submit=str(args.get("tiku_submit") or "false").lower() == "true",
+            )
+        except Exception as exc:  # noqa: BLE001 —— tiku 构造失败不该中断刷课
+            _emit({"event": "tiku_failed", "error": f"{type(exc).__name__}: {exc}"})
+            tiku = None
+        client = build_client(upstream_path, tiku=tiku)
+    else:
+        client = build_client(upstream_path)
     if client is None:
         return _fail("DEPS_MISSING", "写侧上游依赖不可用", EXIT_DEPS, INSTALL_HINT)
 

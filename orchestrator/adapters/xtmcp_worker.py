@@ -110,8 +110,16 @@ def main() -> int:
             if course is None:
                 return _fail("INVALID_PARAM", "fetch_homework 需要 course_id", EXIT_INTERNAL)
             data = client.fetch_homework(course)
+        elif op == "fetch_homework_detail":
+            course = resolve_course(client, args.get("course_id"))
+            if course is None:
+                return _fail("INVALID_PARAM", "fetch_homework_detail 需要 course_id", EXIT_INTERNAL)
+            data = client.fetch_homework_detail(course, index=int(args.get("index") or 1))
         elif op == "fetch_deadline_overview":
-            data = client.fetch_deadline_overview(course=args.get("course"))
+            # course 键兼容：统一层历史上有传 course / course_id 两种写法
+            data = client.fetch_deadline_overview(
+                course=args.get("course") or args.get("course_id")
+            )
         elif op == "fetch_exams":
             data = client.fetch_exams()
         elif op == "fetch_notices":
