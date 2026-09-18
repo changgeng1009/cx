@@ -51,6 +51,32 @@ FAKE_WORKER = textwrap.dedent(
                           "message": "课程不存在"}))
         sys.exit(1)
 
+    if op == "sign_scan":
+        acts = [{"course_id": "1", "course_name": "测试课", "activity_id": "a1",
+                 "title": "第3周签到", "status": "pending", "open_at": "2026-09-18 10:00",
+                 "deadline": "", "attend_num": 5, "user_status": 1,
+                 "sign_type": "unknown", "sign_type_hint": "0", "raw": {"id": 1}}]
+        print(json.dumps({"ok": True, "data": {"activities": acts,
+                                               "scanned_courses": 2,
+                                               "only_running": True,
+                                               "errors": []}}, ensure_ascii=False))
+        sys.exit(0)
+
+    if op == "sign_execute":
+        print(json.dumps({"ok": True, "data": {
+            "activity_id": req["args"].get("activity_id"),
+            "course_id": req["args"].get("course_id"),
+            "course_name": "测试课",
+            "sign_type": req["args"].get("sign_type"),
+            "activity": None,
+            "presign_ok": True,
+            "obj_id": req["args"].get("obj_id"),
+            "lat": req["args"].get("lat"),
+            "lon": req["args"].get("lon"),
+            "response": os.environ.get("FAKE_SIGN_TEXT", "签到成功"),
+        }}, ensure_ascii=False))
+        sys.exit(0)
+
     # ---- run：事件流 ----
     import threading
     got_cancel = {"v": False}
@@ -84,6 +110,113 @@ FAKE_WORKER = textwrap.dedent(
     sys.exit(0)
     """
 )
+
+
+class SignCapabilityTests(unittest.TestCase):
+    """M6 签到：能力路由、参数透传、返回文本归一。"""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.worker = self.base / "fake_worker.py"
+        self.worker.write_text(FAKE_WORKER, encoding="utf-8")
+        accounts = self.base / "accounts" / "acc_01"
+        accounts.mkdir(parents=True)
+        (accounts / "cookies.json").write_text(
+            json.dumps({"cookies": [{"name": "UID", "value": "v", "domain": ".chaoxing.com"}]}),
+            encoding="utf-8",
+        )
+        self.adapter = ChaoxingCliAdapter(
+            _manifest(),
+            worker_path=self.worker,
+            accounts_dir=self.base / "accounts",
+            min_interval_ms=0,
+        )
+        self.ctx = TaskContext(request_id="t", account_id="acc_01")
+
+    def _capture(self, capability: str, params: dict) -> dict:
+        cap_file = self.base / "cap.json"
+        os.environ["FAKE_CAPTURE"] = str(cap_file)
+        try:
+            result = self.adapter.invoke(capability, params, self.ctx)
+            self.assertTrue(result.ok, result.error)
+        finally:
+            os.environ.pop("FAKE_CAPTURE", None)
+        return json.loads(cap_file.read_text(encoding="utf-8"))
+
+    def test_c50_routes_to_sign_scan(self) -> None:
+        req = self._capture("C50", {"course_id": "1"})
+        self.assertEqual(req["op"], "sign_scan")
+        self.assertTrue(req["args"]["only_running"])
+
+    def test_c50_all_flag_turns_off_filter(self) -> None:
+        req = self._capture("C50", {"all": True})
+        self.assertFalse(req["args"]["only_running"])
+
+    def test_c50_activities_are_projected(self) -> None:
+        result = self.adapter.invoke("C50", {}, self.ctx)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["count"], 1)
+        self.assertEqual(result.data["activities"][0]["activity_id"], "a1")
+
+    def test_c48_passes_sign_params(self) -> None:
+        req = self._capture(
+            "C48",
+            {
+                "course_id": "1",
+                "activity_id": "a1",
+                "type": "gesture",
+                "obj_id": "1234",
+                "lat": 22.1,
+                "lon": 113.2,
+            },
+        )
+        self.assertEqual(req["op"], "sign_execute")
+        self.assertEqual(req["args"]["activity_id"], "a1")
+        self.assertEqual(req["args"]["sign_type"], "gesture")
+        self.assertEqual(req["args"]["obj_id"], "1234")
+        self.assertEqual(req["args"]["lat"], 22.1)
+
+    def test_sign_result_success(self) -> None:
+        os.environ["FAKE_SIGN_TEXT"] = "签到成功"
+        try:
+            result = self.adapter.invoke(
+                "C48", {"course_id": "1", "activity_id": "a1"}, self.ctx
+            )
+        finally:
+            os.environ.pop("FAKE_SIGN_TEXT", None)
+        self.assertEqual(result.data["status"], "signed")
+        self.assertEqual(result.data["outcome"], "success")
+
+    def test_sign_result_duplicate(self) -> None:
+        os.environ["FAKE_SIGN_TEXT"] = "您已签到"
+        try:
+            result = self.adapter.invoke(
+                "C48", {"course_id": "1", "activity_id": "a1"}, self.ctx
+            )
+        finally:
+            os.environ.pop("FAKE_SIGN_TEXT", None)
+        self.assertEqual(result.data["outcome"], "duplicate")
+
+    def test_sign_result_unknown_text_stays_unknown(self) -> None:
+        """平台文案没见过时必须给 unknown，而不是假装成功。"""
+        os.environ["FAKE_SIGN_TEXT"] = "some unexpected body"
+        try:
+            result = self.adapter.invoke(
+                "C48", {"course_id": "1", "activity_id": "a1"}, self.ctx
+            )
+        finally:
+            os.environ.pop("FAKE_SIGN_TEXT", None)
+        self.assertEqual(result.data["outcome"], "unknown")
+        self.assertEqual(result.data["status"], "unknown")
+
+    def test_c51_is_not_claimed(self) -> None:
+        """签退未实现：不能装作支持（如实返回 unsupported）。"""
+        result = self.adapter.invoke("C51", {}, self.ctx)
+        self.assertFalse(result.ok)
 
 
 class QuizRecheckTests(unittest.TestCase):

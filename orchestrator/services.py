@@ -935,11 +935,28 @@ class Orchestrator:
     ) -> Envelope:
         ctx = TaskContext(request_id=request_id, account_id=account_id)
         router = self._make_router(logger)
-        capability = "C48" if command in ("sign_in", "sign_status") else "C50"
-        outcome = router.execute(capability, params, ctx, command=command)
+        # C48 = 执行（写）；C50 = 发现/监测（读）。sign_status 与 sign_watch 都是
+        # "看有哪些能签"，属 C50；只有 sign_in 会写平台。
+        capability = "C48" if command == "sign_in" else "C50"
+
+        if command == "sign_watch":
+            # 有界轮询：等"老师发起签到"。一旦发现新的进行中活动就立即返回
+            # （操作者/Agent 拿到 activity_id 去 sign_in），到时长上限则退出。
+            outcome = self._sign_watch_loop(
+                router, params, ctx, logger, account_id, request_id, started
+            )
+        else:
+            outcome = router.execute(capability, params, ctx, command=command)
 
         warnings = list(outcome.warnings)
-        if outcome.ok and command == "sign_in":
+        if command == "sign_in" and outcome.ok:
+            status = str((outcome.data or {}).get("status") or "")
+            if status == "unknown":
+                warnings.append(
+                    "平台返回文本无法判定成败，原文见 data.response —— 请人工确认是否签到成功"
+                )
+            if not params.get("activity_id"):
+                warnings.append("未提供 --activity-id，签到可能无效")
             if not self.confirmed and not params.get("dry_run"):
                 # 签到是写操作，但没有 --confirm 时只提示不拦截：
                 # 签到窗口很短，多一次确认可能就意味着错过。
@@ -949,8 +966,11 @@ class Orchestrator:
                 course={"id": str(params.get("course_id", "")), "name": ""},
                 sign_type=str(params.get("type", "normal")),
             )
-        if command == "sign_watch" and not params.get("interval"):
-            warnings.append("sign_watch 在 M0 为一次性轮询；持续监测需在 CLI 外层循环或 M6 实现")
+        if command == "sign_watch":
+            warnings.append(
+                f"sign_watch 为有界轮询（间隔 {params.get('interval')}s / "
+                f"总时长 {params.get('duration')}s）：到点即退出，长期监测请配自动化任务"
+            )
 
         return self._finish_from_outcome(
             request_id, command, account_id, started, logger, outcome,
@@ -960,6 +980,66 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Cookie 管理
     # ------------------------------------------------------------------
+    def _sign_watch_loop(
+        self,
+        router: Any,
+        params: dict[str, Any],
+        ctx: TaskContext,
+        logger: StructuredLogger,
+        account_id: str,
+        request_id: str,
+        started: Any,
+    ) -> Any:
+        """sign_watch 的有界轮询本体（编排，不碰上游内部）。
+
+        语义：每隔 interval 秒扫一次进行中的签到活动；**发现新活动立即返回**
+        （把 activity_id 交给调用方去 sign_in），最多等到 duration 秒。
+        返回最后一次 router 的 RouterOutcome，data 里带 rounds/elapsed_s/新活动。
+        """
+        import time as _time
+
+        interval = max(int(params.get("interval") or 30), 5)
+        duration = max(int(params.get("duration") or 600), 0)
+        deadline = _time.monotonic() + duration
+        baseline: set[str] = set()
+        rounds = 0
+        last = None
+        discovered: list[dict[str, Any]] = []
+
+        scan_params = {**params, "only_running": True}
+        single_shot = duration <= 0
+        while True:
+            rounds += 1
+            last = router.execute("C50", scan_params, ctx, command="sign_watch")
+            if not last.ok:
+                return last
+            activities = list((last.data or {}).get("activities") or [])
+            fresh = [a for a in activities if a.get("activity_id") not in baseline]
+            if rounds > 1 and fresh:
+                discovered = fresh
+                logger.emit(
+                    Event.SIGN_DETECTED,
+                    round=rounds,
+                    count=len(fresh),
+                    activity_ids=[a.get("activity_id") for a in fresh],
+                )
+                break
+            baseline.update(a.get("activity_id") for a in activities)
+            if single_shot or _time.monotonic() >= deadline:
+                break
+            _time.sleep(min(interval, max(deadline - _time.monotonic(), 0)))
+
+        elapsed = round(duration - max(deadline - _time.monotonic(), 0), 1)
+        last.data = {
+            **(last.data or {}),
+            "rounds": rounds,
+            "elapsed_s": elapsed,
+            "interval_s": interval,
+            "new_activities": discovered,
+            "found": bool(discovered),
+        }
+        return last
+
     def _run_cookies(
         self,
         request_id: str,

@@ -45,7 +45,9 @@ MINIMAL_PARAMS: dict[str, dict[str, object]] = {
     "run_video_tasks": {"course_id": COURSE_1, "dry_run": True},
     "run_reading_tasks": {"course_id": COURSE_1, "dry_run": True},
     "answer_submit": {"ticket_id": "tk_missing", "answers": "A"},
-    "sign_in": {"dry_run": True},
+    "sign_in": {"course_id": COURSE_1, "activity_id": "act_1", "dry_run": True},
+    # sign_watch 是**阻塞轮询**：契约测试必须给它极短时长，否则真等满 duration
+    "sign_watch": {"interval": 5, "duration": 5},
     "cookies_login": {"no_open": True, "timeout": 0.1, "poll": 0.5},
 }
 

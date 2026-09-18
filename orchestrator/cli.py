@@ -178,15 +178,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765)
 
     # ---- 签到 ----
-    p = add("sign_in", "执行签到")
-    p.add_argument("--course-id", default=None)
-    p.add_argument("--type", default="normal")
+    p = add("sign_in", "执行签到（M6：真实上游；普通签到已实测）")
+    p.add_argument("--course-id", required=True, help="课程 ID（sign_status 可查）")
+    p.add_argument(
+        "--activity-id", required=True,
+        help="活动 ID（sign_status 列出的 activity_id，平台内部叫 activeId）",
+    )
+    p.add_argument(
+        "--type", default="normal",
+        choices=["normal", "gesture", "location"],
+        help="签到类型：normal 普通（实测）／gesture 手势（需 --obj-id 手势码）／location 位置（需 --lat/--lon）",
+    )
+    p.add_argument("--obj-id", default="aaa", help="手势签到的手势码")
+    p.add_argument("--lat", type=float, default=None, help="位置签到纬度")
+    p.add_argument("--lon", type=float, default=None, help="位置签到经度")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--confirm", action="store_true")
-    p = add("sign_status", "查询签到状态")
+    p = add("sign_status", "查询进行中的签到活动（只读发现）")
+    p.add_argument("--course-id", default=None, help="不填则遍历全部课程")
+    p.add_argument(
+        "--all", action="store_true",
+        help="连已结束的一并列出（默认只列进行中）",
+    )
+    p = add("sign_watch", "轮询监测新签到（有界循环）")
+    p.add_argument("--interval", type=int, default=30, help="轮询间隔秒数")
+    p.add_argument("--duration", type=int, default=600, help="监测总时长秒数（默认 600）")
     p.add_argument("--course-id", default=None)
-    p = add("sign_watch", "轮询监测新签到")
-    p.add_argument("--interval", type=int, default=30)
 
     # ---- Cookie 管理 ----
     add("cookies", "查看已落盘的 cookie 与体检报告（值已掩码）")
@@ -457,6 +474,45 @@ def _render_data(command: str, data: dict[str, Any]) -> list[str]:
             out.append(f"{indent}- {ch.get('index')}  {ch.get('name')}{mark}")
         if not data.get("chapters"):
             out.append("  （该课程没有返回章节，可能未开放章节功能）")
+        return out
+
+    if command == "sign_status":
+        acts = data.get("activities") or []
+        for a in acts:
+            out.append(
+                f"  - [{a.get('course_name')}] {a.get('title')}  "
+                f"活动={a.get('activity_id')}  课程={a.get('course_id')}  "
+                f"{a.get('open_at')}~{a.get('deadline')}  已参与={a.get('attend_num')}"
+            )
+        if not acts:
+            out.append("  （当前没有进行中的签到活动）")
+        else:
+            out.append(f"  共 {len(acts)} 个；签到场：cx sign_in --course-id <课程> --activity-id <活动> --confirm")
+        if data.get("errors"):
+            out.append(f"  （{len(data['errors'])} 门课查询失败，详见 raw）")
+        return out
+
+    if command == "sign_watch":
+        for a in data.get("new_activities") or []:
+            out.append(
+                f"  [新签到] {a.get('title')}  活动={a.get('activity_id')}  "
+                f"课程={a.get('course_id')}  {a.get('open_at')}~{a.get('deadline')}"
+            )
+        if not data.get("found"):
+            out.append(
+                f"  （轮询 {data.get('rounds')} 轮 / {data.get('elapsed_s')}s 内没有新签到）"
+            )
+        return out
+
+    if command == "sign_in":
+        out.append(
+            f"  状态: {data.get('status')}（outcome={data.get('outcome')}）  "
+            f"类型={data.get('sign_type')}  活动={data.get('activity_id')}"
+        )
+        if data.get("course_name"):
+            out.append(f"  课程: {data.get('course_name')}")
+        if data.get("response"):
+            out.append(f"  平台原文: {data.get('response')}")
         return out
 
     if command == "answer_clean":

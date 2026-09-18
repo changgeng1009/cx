@@ -278,6 +278,9 @@ class ChaoxingCliAdapter(Adapter):
             "C12": "run",
             "C14": "run",
             "C18": "run",
+            # M6 签到：C50 发现、C48 执行（C49 类型覆盖是声明，无独立 op）
+            "C50": "sign_scan",
+            "C48": "sign_execute",
         }
         op = op_map.get(capability_id)
         if op is None:
@@ -302,18 +305,40 @@ class ChaoxingCliAdapter(Adapter):
             # 默认不交卷（安全默认）：答完只在平台侧保存，由使用者决定是否正式提交
             args["tiku_submit"] = "true" if params.get("submit_answers") else "false"
 
+        if op == "sign_scan":
+            # CLI 给的是 `--all`（要看已结束的）；能力声明里是 only_running
+            only_running = params.get("only_running")
+            if only_running is None:
+                only_running = not bool(params.get("all"))
+            args["only_running"] = bool(only_running)
+
+        if op == "sign_execute":
+            args["activity_id"] = str(params.get("activity_id") or "")
+            # 参数名兼容：CLI/服务层历史上用 `type`，能力声明里写的是 sign_type
+            args["sign_type"] = str(
+                params.get("sign_type") or params.get("type") or "normal"
+            )
+            args["obj_id"] = str(params.get("obj_id") or "aaa")
+            args["lat"] = params.get("lat")
+            args["lon"] = params.get("lon")
+
         self._throttle()
 
-        if op == "scan_tasks":
+        if op in ("scan_tasks", "sign_scan", "sign_execute"):
             try:
-                code, parsed = self._call_short(op, args, ctx.account_id, 120.0)
+                code, parsed = self._call_short(op, args, ctx.account_id, 180.0)
             except subprocess.TimeoutExpired:
-                return self._timeout_result(op, 120.0)
+                return self._timeout_result(op, 180.0)
             except FileNotFoundError as exc:
                 return self._worker_missing_result(exc)
             if code != EXIT_OK:
                 return self.failure(self._error_from_exit(code, parsed, op))
-            return self.success(self._normalize_scan(parsed.get("data")))
+            data = parsed.get("data") or {}
+            if op == "scan_tasks":
+                return self.success(self._normalize_scan(data))
+            if op == "sign_scan":
+                return self.success(self._normalize_sign_scan(data))
+            return self.success(self._normalize_sign_result(data))
 
         # ---- run：长任务流式 ----
         try:
@@ -364,6 +389,42 @@ class ChaoxingCliAdapter(Adapter):
                 "by_status": by_status,
             },
         }
+
+    @staticmethod
+    def _normalize_sign_scan(data: dict[str, Any]) -> dict[str, Any]:
+        """签到活动发现（C50）。
+
+        保留 `raw`（平台原始活动 dict）：签到子类型（普通/手势/位置/二维码/拍照）
+        在平台侧没有稳定字段，实测前不臆断，把原始数据一并交给使用者与编排层。
+        """
+        activities = list(data.get("activities") or [])
+        return {
+            "activities": activities,
+            "count": len(activities),
+            "scanned_courses": data.get("scanned_courses"),
+            "only_running": data.get("only_running"),
+            "errors": data.get("errors") or [],
+        }
+
+    @staticmethod
+    def _normalize_sign_result(data: dict[str, Any]) -> dict[str, Any]:
+        """签到执行结果（C48）。
+
+        契约对齐 mock 的 C48（`{"sign_type", "status", "activity"}`）。
+        平台 `stuSignajax` 只回一段文本（"签到成功" / "您已签到" / 失败原因），
+        这里只做**关键词归一**，不做业务判断；判定不了就如实给 unknown，
+        原文一律保留在 `response`。
+        """
+        text = str(data.get("response") or "")
+        if "成功" in text:
+            outcome, status = "success", "signed"
+        elif "已签到" in text or "已经签到" in text:
+            outcome, status = "duplicate", "signed"
+        elif any(word in text for word in ("失败", "错误", "无效", "过期", "未开始", "不能")):
+            outcome, status = "failed", "failed"
+        else:
+            outcome, status = "unknown", "unknown"
+        return {**data, "outcome": outcome, "status": status}
 
     def _timeout_result(self, op: str, timeout_s: float) -> AdapterResult:
         return self.failure(

@@ -10,7 +10,7 @@
     "pinned_commit": null,
     "license": "GPL-3.0",
     "isolation": "process",
-    "note": "候选三选一：chaoxing-sign-app(532★,GPL-3.0) / ChaoxingSignFaker(489★,AGPL-3.0) / XBT(124★,GPL-3.0)。全部是浏览器/App 类，且 ChaoxingSignFaker 为 AGPL（传染性最强），必须严格进程隔离。M6 阶段先评估自建最小签到（普通签到通常只是几个 HTTP 请求）是否更省成本。"
+    "note": "候选三选一：chaoxing-sign-app(532★,GPL-3.0) / ChaoxingSignFaker(489★,AGPL-3.0) / XBT(124★,GPL-3.0)。【M6 结论：不启用】签到已由 chaoxing-cli（已接入的上游，GPL-3.0 + 进程隔离）覆盖：上游含 get_activity_list/pre_sign/sign_in_normal 原语，编排在统一层自建（C48/C49/C50）。本 Adapter 保留为备选（其独有能力是浏览器自动化：二维码截图识别、拍照签到），若将来要补这几类签到再评估；注意 ChaoxingSignFaker 为 AGPL（传染性最强），必须严格进程隔离。"
   },
   "runtime": {
     "language": "typescript",
@@ -19,15 +19,41 @@
     "entry": "(待定，M6 评估)"
   },
   "capabilities": {
-    "C48": { "level": "full" },
-    "C49": { "level": "full", "note": "位置/二维码/手势/拍照/签到码，各候选项目覆盖不同" },
-    "C50": { "level": "partial", "note": "监测能力需自建轮询循环" },
-    "C51": { "level": "partial" },
-    "C38": { "level": "full", "note": "依赖浏览器自动化，这是它最大的成本来源" }
+    "C48": {
+      "level": "full",
+      "note": "M6 已由 chaoxing-cli 实现（本 Adapter 未启用）"
+    },
+    "C49": {
+      "level": "full",
+      "note": "位置/二维码/手势/拍照/签到码，各候选项目覆盖不同"
+    },
+    "C50": {
+      "level": "partial",
+      "note": "M6 已由 chaoxing-cli 的 sign_scan 实现（本 Adapter 未启用）"
+    },
+    "C51": {
+      "level": "partial"
+    },
+    "C38": {
+      "level": "full",
+      "note": "依赖浏览器自动化，这是它最大的成本来源"
+    }
   },
   "health": {
-    "probe": { "capability": "C48", "method": "invoke", "args": { "dry_run": true }, "timeout_ms": 60000 },
-    "degrade_on": ["platform_changed"]
+    "probe": {
+      "capability": "C48",
+      "method": "invoke",
+      "args": {
+        "dry_run": true
+      },
+      "timeout_ms": 60000
+    },
+    "degrade_on": [
+      "platform_changed"
+    ]
   },
-  "limits": { "max_concurrency": 1, "min_interval_ms": 3000 }
+  "limits": {
+    "max_concurrency": 1,
+    "min_interval_ms": 3000
+  }
 }

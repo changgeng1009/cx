@@ -19,14 +19,74 @@
     "entry": "orchestrator/adapters/cxcli_worker.py"
   },
   "capabilities": {
-    "C09": { "level": "full", "op": "scan_tasks", "note": "任务点细化（自建 C09 的真实数据源）：get_course_point + get_job_list 逐章扫描，纯 GET" },
-    "C12": { "level": "full", "op": "run", "params": ["speed"], "note": "视频任务；上游 study_video 对音频任务自动 fallback Audio" },
-    "C14": { "level": "full", "op": "run", "note": "文档/阅读任务（document + read）" },
-    "C18": { "level": "full", "op": "run", "note": "整课/单章（chapter_id 过滤在 worker 编排层做，任务点处理走上游 process_job）" }
+    "C09": {
+      "level": "full",
+      "op": "scan_tasks",
+      "note": "任务点细化（自建 C09 的真实数据源）：get_course_point + get_job_list 逐章扫描，纯 GET"
+    },
+    "C12": {
+      "level": "full",
+      "op": "run",
+      "params": [
+        "speed"
+      ],
+      "note": "视频任务；上游 study_video 对音频任务自动 fallback Audio"
+    },
+    "C14": {
+      "level": "full",
+      "op": "run",
+      "note": "文档/阅读任务（document + read）"
+    },
+    "C18": {
+      "level": "full",
+      "op": "run",
+      "note": "整课/单章（chapter_id 过滤在 worker 编排层做，任务点处理走上游 process_job）"
+    },
+    "C48": {
+      "level": "partial",
+      "op": "sign_execute",
+      "params": [
+        "activity_id",
+        "course_id",
+        "sign_type",
+        "obj_id",
+        "lat",
+        "lon"
+      ],
+      "note": "执行签到（自建编排，复用上游 sign_in_normal/pre_sign 原语）。普通签到 normal 已实测；gesture（需 obj_id 手势码）/location（需 lat/lon）已实现但缺真实活动验证 —— 故整体标 partial。"
+    },
+    "C49": {
+      "level": "partial",
+      "op": "sign_execute",
+      "note": "类型覆盖：上游 SignType 仅 NORMAL/GESTURE/LOCATION 三型；平台侧签到子类型（二维码/拍照/签到码）无稳定字段可判，发现结果里保留 raw 原始活动 dict 供识别。"
+    },
+    "C50": {
+      "level": "full",
+      "op": "sign_scan",
+      "params": [
+        "course_id",
+        "only_running"
+      ],
+      "note": "签到活动发现：遍历课程 → get_activity_list → 按 activeType==2 且 status==1 过滤，纯 GET"
+    },
+    "C51": {
+      "level": "none",
+      "note": "签退：上游无对应原语（SignType 与 stuSignajax 均不覆盖），未实现 —— 如实标 none"
+    }
   },
   "health": {
-    "probe": { "method": "worker_ping", "timeout_ms": 20000, "note": "ping 无网络副作用；真实连通性由 worker 登录探测承担" },
-    "degrade_on": ["platform_changed", "risk_control"]
+    "probe": {
+      "method": "worker_ping",
+      "timeout_ms": 20000,
+      "note": "ping 无网络副作用；真实连通性由 worker 登录探测承担"
+    },
+    "degrade_on": [
+      "platform_changed",
+      "risk_control"
+    ]
   },
-  "limits": { "max_concurrency": 1, "min_interval_ms": 1500 }
+  "limits": {
+    "max_concurrency": 1,
+    "min_interval_ms": 1500
+  }
 }

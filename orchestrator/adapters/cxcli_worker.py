@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 
 EXIT_OK = 0
 EXIT_INTERNAL = 1
@@ -198,6 +199,186 @@ def job_still_pending(client, course: dict, raw_point: dict, job_id: str) -> boo
         if str(job.get("jobid") or "") == job_id:
             return True
     return False
+
+
+# --------------------------------------------------------------------------
+# M6 签到（C48/C49/C50）：发现 → 判型 → 执行
+#
+# 上游提供了 HTTP 原语（get_activity_list / pre_sign / sign_in_normal），
+# 但**没有任何可用编排**（main.py 的 --auto-sign 解析完就没人用，是死代码）。
+# 所以"扫描哪些课、哪些活动算进行中、用什么类型签"由统一层编排 —— 符合
+# 架构红线 R3（统一层不复制上游业务逻辑，只做编排与规范化）。
+# --------------------------------------------------------------------------
+
+#: 平台活动类型：2 = 签到（探针实测，见 scripts/sign_probe.py）
+SIGN_ACTIVE_TYPE = 2
+#: 平台活动状态：1 = 进行中，2 = 已结束
+SIGN_STATUS_RUNNING = 1
+
+#: 上游 SignType 名称 ↔ 统一层类型名
+SIGN_TYPE_NAMES = {
+    "normal": "NORMAL",
+    "gesture": "GESTURE",
+    "location": "LOCATION",
+}
+
+
+#: 东八区（worker 是独立脚本、不依赖 orchestrator 包，故此处自带时区）
+_CST = timezone(timedelta(hours=8))
+
+
+def ms_to_iso(ms: Any, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """平台毫秒时间戳 → 东八区字符串（取不到返回空串）。
+
+    格式与 `orchestrator/fixtures.py:make_sign_activity` 的 open_at/deadline 对齐，
+    这样 mock 与真实 Adapter 的返回对上层是同一种东西。
+    """
+    try:
+        seconds = float(ms or 0) / 1000.0
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    return datetime.fromtimestamp(seconds, _CST).strftime(fmt)
+
+
+def normalize_activity(act: dict, course: dict) -> dict:
+    """平台活动 → 统一契约（对齐 `fixtures.make_sign_activity`）。
+
+    字段名全部来自探针实测（scripts/sign_probe.py）：
+    `id`=活动ID（签到时作 activeId）、`nameOne`=活动名、`startTime`/`endTime`=毫秒、
+    `status` 1=进行中/2=已结束、`attendNum`=已参与人数、`userStatus`=本人状态原始值。
+
+    `sign_type` 固定给 "unknown"：平台侧签到子类型没有稳定字段，实测前不臆断，
+    由使用者在 `sign_in --type` 显式指定。`raw` 原样保留供识别。
+    """
+    status = act.get("status")
+    return {
+        "course_id": str(course.get("courseId") or ""),
+        "course_name": course.get("title") or "",
+        "activity_id": str(act.get("id") or ""),
+        "title": act.get("nameOne") or "",
+        "sign_type": "unknown",
+        # 平台 otherId 疑似就是签到类型编码（实测线索：otherId=0 的活动标题就叫
+        # "普通签到"）。但只有这一条线索，不足以当事实 —— 作为提示暴露，签到时
+        # 仍建议用 --type 显式指定。
+        "sign_type_hint": str(act.get("otherId") or ""),
+        "open_at": ms_to_iso(act.get("startTime")),
+        "deadline": ms_to_iso(act.get("endTime")),
+        "time_label": act.get("nameFour") or "",
+        "status": "pending" if status == SIGN_STATUS_RUNNING else "ended",
+        "attend_num": act.get("attendNum"),
+        "user_status": act.get("userStatus"),
+        "raw": act,
+    }
+
+
+def scan_sign_activities(client, args: dict) -> dict:
+    """扫描签到活动（只读）。
+
+    - 不给 course_id：遍历全部课程
+    - only_running=True（默认）：只返回进行中的（`status == 1`）
+    """
+    course_id = str(args.get("course_id") or "")
+    only_running = bool(args.get("only_running", True))
+
+    courses = list(client.get_course_list() or [])
+    if course_id:
+        courses = [c for c in courses if str(c.get("courseId")) == course_id]
+        if not courses:
+            raise ValueError(f"课程不存在：{course_id}")
+
+    activities: list[dict] = []
+    errors: list[dict] = []
+    for course in courses:
+        try:
+            raw_acts = client.get_activity_list(course) or []
+        except Exception as exc:  # noqa: BLE001 —— 单课失败不影响其它课
+            errors.append({"course_id": course.get("courseId"),
+                           "error": f"{type(exc).__name__}: {exc}"})
+            _emit({"event": "sign_scan_error",
+                   "course_id": course.get("courseId"),
+                   "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        for act in raw_acts:
+            if act.get("activeType") != SIGN_ACTIVE_TYPE:
+                continue
+            item = normalize_activity(act, course)
+            if only_running and item["status"] != "pending":
+                continue
+            activities.append(item)
+
+    return {
+        "activities": activities,
+        "scanned_courses": len(courses),
+        "only_running": only_running,
+        "errors": errors,
+    }
+
+
+def execute_sign(client, args: dict) -> dict:
+    """执行签到（**写操作**，需编排层 --confirm 门禁）。
+
+    类型：normal（普通签到，已实测）／gesture（手势，需 --obj-id 手势码）
+    ／location（位置，需 --lat/--lon）。类型判定未实测的部分保守交给使用者指定。
+    """
+    from api.base import SignType  # noqa: PLC0415 —— 子进程内动态加载上游
+
+    course_id = str(args.get("course_id") or "")
+    activity_id = str(args.get("activity_id") or "")
+    if not activity_id:
+        raise ValueError("缺少 activity_id")
+    course = find_course(client, course_id) if course_id else None
+    if course is None:
+        raise ValueError(f"课程不存在：{course_id}")
+
+    sign_type = str(args.get("sign_type") or "normal").strip().lower()
+    if sign_type not in SIGN_TYPE_NAMES:
+        raise ValueError(f"不支持的签到类型：{sign_type}（可选 normal/gesture/location）")
+    type_enum = getattr(SignType, SIGN_TYPE_NAMES[sign_type])
+
+    obj_id = str(args.get("obj_id") or "aaa")
+    lat = args.get("lat")
+    lon = args.get("lon")
+    lat = float(lat) if lat not in (None, "") else -1
+    lon = float(lon) if lon not in (None, "") else -1
+
+    # 上游原语：先 preSign 建立签到上下文，再打 stuSignajax
+    presign_ok = True
+    try:
+        client.pre_sign(course, activity_id)
+    except Exception as exc:  # noqa: BLE001 —— preSign 失败仍尝试正式签到
+        presign_ok = False
+        _emit({"event": "sign_presign_failed",
+               "error": f"{type(exc).__name__}: {exc}"})
+
+    # 回填该活动的统一契约形状（找不到也不影响签到动作本身）
+    activity = None
+    try:
+        for act in client.get_activity_list(course) or []:
+            if str(act.get("id") or "") == activity_id:
+                activity = normalize_activity(act, course)
+                break
+    except Exception as exc:  # noqa: BLE001 —— 仅用于回填，失败不阻断签到
+        _emit({"event": "sign_activity_lookup_failed",
+               "error": f"{type(exc).__name__}: {exc}"})
+
+    text = client.sign_in_normal(
+        course, activity_id, name="", obj_id=obj_id,
+        lat=lat, lon=lon, type_=type_enum,
+    )
+    return {
+        "activity_id": activity_id,
+        "course_id": course_id,
+        "course_name": course.get("title") or "",
+        "sign_type": sign_type,
+        "activity": activity,
+        "presign_ok": presign_ok,
+        "obj_id": obj_id,
+        "lat": lat,
+        "lon": lon,
+        "response": str(text or "").strip()[:500],
+    }
 
 
 def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
@@ -433,6 +614,12 @@ def main() -> int:
                 return _fail("COURSE_NOT_FOUND", f"课程不存在：{args.get('course_id')}", EXIT_INTERNAL)
             summary = run_course(client, course, args, flag)
             _emit({"ok": True, "data": summary})
+            return EXIT_OK
+        if op == "sign_scan":
+            _emit({"ok": True, "data": scan_sign_activities(client, args)})
+            return EXIT_OK
+        if op == "sign_execute":
+            _emit({"ok": True, "data": execute_sign(client, args)})
             return EXIT_OK
         return _fail("UNKNOWN_OP", f"未知 op：{op}", EXIT_INTERNAL)
     except Exception as exc:  # noqa: BLE001 —— worker 边界必须兜住一切
