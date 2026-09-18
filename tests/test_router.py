@@ -11,7 +11,7 @@ import unittest
 from orchestrator.adapters.mock import MockAdapter
 from orchestrator.errors import AdapterError, Codes, ErrorCategory
 from orchestrator.models import TaskContext, TaskState
-from orchestrator.registry import CapabilityRegistry
+from orchestrator.registry import CapabilityRegistry, Manifest
 from orchestrator.risk import RiskDetector
 from orchestrator.router import TaskRouter
 from orchestrator.structured_log import StructuredLogger
@@ -234,6 +234,47 @@ class RiskControlTests(unittest.TestCase):
 
     def test_429_is_risk(self) -> None:
         self.assertIsNotNone(RiskDetector().detect("", status_code=429))
+
+
+class MockMustNeverWinTests(unittest.TestCase):
+    """mock 永远排在真实 Adapter 之后 —— 哪怕它"声明得更完整"。
+
+    实测事故（2026-09-18）：C48 签到如实标 partial、mock 标 full，于是按
+    "full 优先于 partial" 的排序，`sign_in` **静默走了 mock**，返回"已签到"
+    而平台上什么都没发生。写操作上的假成功比报错危险得多。
+    """
+
+    def _adapter(self, mid: str, kind: str, decl: dict, priority: int):
+        raw = {
+            "id": mid,
+            "name": mid,
+            "kind": kind,
+            "enabled": True,
+            "priority": priority,
+            "capabilities": decl,
+        }
+        manifest = Manifest.from_dict(raw, source_path=f"{mid}.json")
+        return MockAdapter(manifest)
+
+    def test_partial_real_beats_full_mock(self) -> None:
+        real = self._adapter("real", "subprocess", {"C48": {"level": "partial"}}, 15)
+        mock = self._adapter("mock", "mock", {"C48": {"level": "full"}}, 90)
+        registry = _registry(mock, real)
+        order = [a.manifest.id for a in registry.candidates("C48")]
+        self.assertEqual(order, ["real", "mock"])
+
+    def test_mock_still_serves_when_alone(self) -> None:
+        mock = self._adapter("mock", "mock", {"C48": {"level": "full"}}, 90)
+        registry = _registry(mock)
+        self.assertEqual([a.manifest.id for a in registry.candidates("C48")], ["mock"])
+
+    def test_two_real_adapters_keep_full_before_partial(self) -> None:
+        """真实 Adapter 之间仍按 full > partial（这条老规则不能被破坏）。"""
+        full = self._adapter("a-full", "subprocess", {"C48": {"level": "full"}}, 50)
+        part = self._adapter("b-part", "subprocess", {"C48": {"level": "partial"}}, 10)
+        registry = _registry(part, full)
+        order = [a.manifest.id for a in registry.candidates("C48")]
+        self.assertEqual(order, ["a-full", "b-part"])
 
 
 if __name__ == "__main__":

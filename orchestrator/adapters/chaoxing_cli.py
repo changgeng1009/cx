@@ -411,9 +411,14 @@ class ChaoxingCliAdapter(Adapter):
         """签到执行结果（C48）。
 
         契约对齐 mock 的 C48（`{"sign_type", "status", "activity"}`）。
-        平台 `stuSignajax` 只回一段文本（"签到成功" / "您已签到" / 失败原因），
-        这里只做**关键词归一**，不做业务判断；判定不了就如实给 unknown，
-        原文一律保留在 `response`。
+        平台 `stuSignajax` 只回一段文本，这里只做**关键词归一**，不做业务判断；
+        判定不了就如实给 unknown，原文一律保留在 `response`。
+
+        实测到的原文（2026-09-18）：
+        - "您已签到过了"          → duplicate（已签过，重复签到）
+        - "签到失败，请重新扫描"    → failed（该活动需要扫码/手势等其它方式）
+        尚未观察到首次成功时的文案（现有靶子一个已签过、一个需扫码），
+        故 "签到成功" → success 这条是**按文案惯例**写的，未实测。
         """
         text = str(data.get("response") or "")
         if "成功" in text:

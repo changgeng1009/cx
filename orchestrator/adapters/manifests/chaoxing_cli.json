@@ -53,12 +53,12 @@
         "lat",
         "lon"
       ],
-      "note": "执行签到（自建编排，复用上游 sign_in_normal/pre_sign 原语）。普通签到 normal 已实测；gesture（需 obj_id 手势码）/location（需 lat/lon）已实现但缺真实活动验证 —— 故整体标 partial。"
+      "note": "执行签到（自建编排，复用上游 sign_in_normal/pre_sign 原语）。实测：请求链路与响应判定已真实跑通（平台回『您已签到过了』→duplicate、『签到失败，请重新扫描』→failed）；**首次签到成功的文案未观察到**（现有两个靶子：一个已签过、一个需扫码），故整体仍标 partial。类型：normal 已实现；gesture（--obj-id 手势码）/location（--lat/--lon）已实现但缺真实活动验证。"
     },
     "C49": {
       "level": "partial",
       "op": "sign_execute",
-      "note": "类型覆盖：上游 SignType 仅 NORMAL/GESTURE/LOCATION 三型；平台侧签到子类型（二维码/拍照/签到码）无稳定字段可判，发现结果里保留 raw 原始活动 dict 供识别。"
+      "note": "类型覆盖：上游 SignType 仅 NORMAL/GESTURE/LOCATION 三型。平台侧无稳定类型字段，但实测发现 `otherId` **疑似就是类型编码**（证据：otherId=0 的活动标题即『普通签到』且接受普通签到；otherId=2 的回『请重新扫描』）—— 仅作 sign_type_hint 提示，不作为判据。二维码/拍照签到需要图片识别或浏览器自动化，未覆盖。"
     },
     "C50": {
       "level": "full",

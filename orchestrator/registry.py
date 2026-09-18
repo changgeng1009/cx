@@ -194,16 +194,28 @@ class CapabilityRegistry:
         而不必去改声明文件。
 
         排序规则（决定 fallback 顺序）：
-        1. `full` 优先于 `partial`——部分实现先上会掩盖更好的实现
-        2. 同档内按 manifest.priority 升序
-        3. 仍相同则按 id 稳定排序，保证结果可复现（测试依赖这一点）
+        1. **内置兜底 mock 永远最后**——它的数据是合成的，不能因为"声明得更完整"
+           就压过真 Adapter
+        2. `full` 优先于 `partial`——部分实现先上会掩盖更好的实现
+        3. 同档内按 manifest.priority 升序
+        4. 仍相同则按 id 稳定排序，保证结果可复现（测试依赖这一点）
+
+        规则 1 是踩坑后加的（2026-09-18 实测事故）：C48 签到如实标 `partial`、
+        mock 标 `full`，于是 `sign_in` **静默走了 mock**，返回"已签到"而平台上
+        什么都没发生 —— 写操作上的假成功比报错危险得多。
+
+        判据用 `id == "mock"`（内置兜底 Adapter 的固定 id）而不是 `kind == "mock"`：
+        测试替身也常用 MockAdapter 承载自定义 manifest，用 kind 会误伤它们。
         """
         rows: list[tuple[int, int, str, Any]] = []
         for adapter in self.enabled():
             manifest: Manifest = adapter.manifest
             if not adapter.supports(capability_id):
                 continue
-            tier = 0 if manifest.level(capability_id) == CapabilityLevel.FULL else 1
+            if manifest.id == "mock":
+                tier = 2
+            else:
+                tier = 0 if manifest.level(capability_id) == CapabilityLevel.FULL else 1
             rows.append((tier, manifest.priority, manifest.id, adapter))
         rows.sort(key=lambda r: (r[0], r[1], r[2]))
         return [r[3] for r in rows]
