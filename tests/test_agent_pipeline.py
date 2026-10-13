@@ -537,6 +537,30 @@ class KnownAnswersTests(unittest.TestCase):
                 broker.lookup_known("题目：通常将交流1kv以下的电压称为:____。"), "低压"
             )
 
+    def test_prompt_is_dumped_for_diagnosis(self) -> None:
+        """上游重做轮的 prompt 含平台给的正确答案 —— 必须落盘，否则信息永久丢失。"""
+        from orchestrator.openai_shim import dump_prompt
+
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            dump_prompt(broker, "题目：测试题\n  正确答案：X")
+            folder = broker.root / "requests"
+            files = list(folder.glob("*.txt"))
+            self.assertEqual(len(files), 1)
+            self.assertIn("正确答案：X", files[0].read_text(encoding="utf-8"))
+
+    def test_dump_failure_never_breaks_answering(self) -> None:
+        """落盘是诊断旁路：即使失败也不能影响答题主链路。"""
+        from pathlib import Path as _Path
+        from unittest import mock
+
+        from orchestrator.openai_shim import dump_prompt
+
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            with mock.patch.object(_Path, "mkdir", side_effect=OSError("no perm")):
+                dump_prompt(broker, "任意")  # 不应抛异常
+
     def test_shim_answers_without_ticket(self) -> None:
         """端到端：命中已知答案时，不产生工单、直接回 OpenAI 格式。"""
         from orchestrator.openai_shim import handle_chat_payload

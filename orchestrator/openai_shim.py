@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -193,6 +195,23 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, handle_chat_payload(self.broker, payload, self.echo))
 
 
+def dump_prompt(broker: AnswerBroker, prompt: str) -> None:
+    """把上游发来的完整 prompt 落盘（`runs/answer/requests/`）。
+
+    为什么需要：上游在章节检测**重做轮**会把「上一轮错误反馈」拼进 prompt，
+    而反馈里**含每道题的正确答案**（来自平台 `work/record-detail`）。这是拿到
+    平台判分的唯一信息源 —— 一旦被"已知答案直答"提前截胡，这份信息就丢了。
+    落盘后就能离线分析（例如：我备的答案错在哪一题、正确答案是什么）。
+    """
+    try:
+        folder = broker.root / "requests"
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.txt"
+        (folder / name).write_text(prompt, encoding="utf-8")
+    except Exception:  # noqa: BLE001 —— 诊断落盘绝不能影响答题主链路
+        pass
+
+
 def handle_chat_payload(
     broker: AnswerBroker,
     payload: dict[str, Any],
@@ -209,6 +228,7 @@ def handle_chat_payload(
     """
     prompt = extract_prompt(payload)
     model = str(payload.get("model") or DEFAULT_MODEL)
+    dump_prompt(broker, prompt)
 
     known = broker.lookup_known(prompt)
     if known is not None:
