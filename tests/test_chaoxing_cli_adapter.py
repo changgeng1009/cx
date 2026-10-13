@@ -296,6 +296,51 @@ class WorkerGuardTests(unittest.TestCase):
             self.assertEqual(sent.kwargs.get("timeout"), 7)
 
 
+class EventForwardingTests(unittest.TestCase):
+    """worker 事件的转发映射 —— 曾经 pace_wait / job_recheck 被静默丢弃。"""
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+
+        def report(self, event: str, **fields) -> None:
+            self.events.append((event, fields))
+
+    def _forward(self, payload: dict) -> list[tuple[str, dict]]:
+        ctx = self._Ctx()
+        ChaoxingCliAdapter._forward_event(payload, ctx)
+        return ctx.events
+
+    def test_pace_wait_maps_to_throttle_wait(self) -> None:
+        """限速必须可观测 —— 否则无法判断防护到底有没有生效。"""
+        events = self._forward({"event": "pace_wait", "seconds": 12.5})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "throttle.wait")
+        self.assertEqual(events[0][1]["seconds"], 12.5)
+        self.assertEqual(events[0][1]["source"], "worker_pace")
+
+    def test_job_recheck_counts_as_completed_with_marker(self) -> None:
+        events = self._forward(
+            {"event": "job_recheck", "task_point_id": "w1", "type": "quiz", "note": "n"}
+        )
+        self.assertEqual(events[0][0], "task_point.completed")
+        self.assertTrue(events[0][1]["recheck"])
+        self.assertEqual(events[0][1]["task_point_id"], "w1")
+
+    def test_job_done_success_is_completed(self) -> None:
+        events = self._forward(
+            {"event": "job_done", "task_point_id": "v1", "type": "video", "result": "SUCCESS"}
+        )
+        self.assertEqual(events[0][0], "task_point.completed")
+        self.assertNotIn("error", events[0][1])
+
+    def test_job_done_failure_is_failed(self) -> None:
+        events = self._forward(
+            {"event": "job_done", "task_point_id": "v1", "type": "video", "result": "ERROR"}
+        )
+        self.assertEqual(events[0][0], "task_point.failed")
+
+
 class PaceTests(unittest.TestCase):
     """秒完成任务点的限速 —— 防平台判「操作异常」（实测 9010 验证码 → 403 熔断）。"""
 

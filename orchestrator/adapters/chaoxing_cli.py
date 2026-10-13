@@ -238,6 +238,24 @@ class ChaoxingCliAdapter(Adapter):
                 task_type=str(payload.get("type") or ""),
                 reason=str(payload.get("reason") or ""),
             )
+        elif event == "pace_wait":
+            # 秒完成任务点之间的限速等待（防风控的核心节流）。
+            # 之前这个事件被静默丢弃，导致"限速到底有没有生效"无从观测。
+            ctx.report(
+                Event.THROTTLE_WAIT,
+                seconds=payload.get("seconds"),
+                source="worker_pace",
+            )
+        elif event == "job_recheck":
+            # 上游报失败但复扫平台确认已完成（假失败消除）—— 也是 completed，
+            # 但打上 recheck 标记便于区分"真完成"与"纠正后完成"。
+            ctx.report(
+                Event.TASK_POINT_COMPLETED,
+                task_point_id=str(payload.get("task_point_id") or ""),
+                task_type=str(payload.get("type") or ""),
+                recheck=True,
+                note=str(payload.get("note") or ""),
+            )
 
     # ------------------------------------------------------------------
     @staticmethod

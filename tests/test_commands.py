@@ -8,11 +8,15 @@ V1 的核心断言是：**每一条命令都要返回结构完整的 Envelope**�
 from __future__ import annotations
 
 import unittest
+from typing import Any
 
+from orchestrator.adapters.mock import MockAdapter
+from orchestrator.errors import risk_control
 from orchestrator.models import Envelope
 from orchestrator.services import COMMANDS
+from orchestrator.structured_log import Event
 
-from .helpers import Sandbox
+from .helpers import Sandbox, mock_manifest
 
 REQUIRED_KEYS = {
     "ok",
@@ -50,6 +54,132 @@ MINIMAL_PARAMS: dict[str, dict[str, object]] = {
     "sign_watch": {"interval": 5, "duration": 5},
     "cookies_login": {"no_open": True, "timeout": 0.1, "poll": 0.5},
 }
+
+
+class RiskAutoResumeTests(unittest.TestCase):
+    """风控熔断后的自动续跑（`--risk-retries`）。
+
+    核心安全属性：**重试必须带上"已完成"的跳过集合** —— 否则会把上一轮刷过的
+    任务点再刷一遍，既浪费又叠加风控风险（实测 2026-10-13 一晚被拦 3 次）。
+    """
+
+    def _make_first_risk_then_ok(self) -> tuple[Any, list[dict]]:
+        calls: list[dict] = []
+        holder: dict[str, Any] = {}
+
+        def handler(capability_id: str, params: dict, ctx: Any):
+            calls.append(dict(params))
+            if len(calls) == 1:
+                # 第一轮：先完成 1 个任务点，再遭遇风控熔断
+                ctx.report(Event.TASK_POINT_COMPLETED, task_point_id="tp_1", task_type="video")
+                return holder["a"].failure(risk_control("403"), raw_output="")
+            return holder["a"].success(
+                {"completed": [], "failed": [], "skipped": [], "stopped_reason": "finished"}
+            )
+
+        adapter = MockAdapter(mock_manifest(), overrides={"C18": handler})
+        holder["a"] = adapter
+        return adapter, calls
+
+    def test_retries_after_risk_and_succeeds(self) -> None:
+        adapter, calls = self._make_first_risk_then_ok()
+        with Sandbox(adapters=[adapter]) as sandbox:
+            envelope = sandbox.run(
+                "run_course", confirmed=True, course_id="C1", risk_retries=2, risk_wait=0
+            )
+        self.assertEqual(len(calls), 2, "风控后应重试一次")
+        self.assertTrue(envelope.ok, envelope.error)
+
+    def test_retry_skips_already_completed(self) -> None:
+        adapter, calls = self._make_first_risk_then_ok()
+        with Sandbox(adapters=[adapter]) as sandbox:
+            sandbox.run(
+                "run_course", confirmed=True, course_id="C1", risk_retries=2, risk_wait=0
+            )
+        self.assertIn("tp_1", list(calls[1].get("skip_task_point_ids") or []))
+
+    def test_no_retry_by_default(self) -> None:
+        adapter, calls = self._make_first_risk_then_ok()
+        with Sandbox(adapters=[adapter]) as sandbox:
+            envelope = sandbox.run("run_course", confirmed=True, course_id="C1")
+        self.assertEqual(len(calls), 1, "默认不重试（行为与加此功能前一致）")
+        self.assertFalse(envelope.ok)
+
+    def test_stops_after_retries_exhausted(self) -> None:
+        calls: list[dict] = []
+        holder: dict[str, Any] = {}
+
+        def always_risk(capability_id: str, params: dict, ctx: Any):
+            calls.append(dict(params))
+            return holder["a"].failure(risk_control("403"), raw_output="")
+
+        adapter = MockAdapter(mock_manifest(), overrides={"C18": always_risk})
+        holder["a"] = adapter
+        with Sandbox(adapters=[adapter]) as sandbox:
+            envelope = sandbox.run(
+                "run_course", confirmed=True, course_id="C1", risk_retries=2, risk_wait=0
+            )
+        self.assertEqual(len(calls), 3, "1 次初始 + 2 次重试后放弃")
+        self.assertFalse(envelope.ok)
+
+    def test_non_risk_failure_is_not_retried(self) -> None:
+        """只有风控才续跑；普通失败立刻返回（避免掩盖真问题）。"""
+        calls: list[dict] = []
+        holder: dict[str, Any] = {}
+
+        def always_input_error(capability_id: str, params: dict, ctx: Any):
+            calls.append(dict(params))
+            from orchestrator.errors import invalid_param
+
+            return holder["a"].failure(invalid_param("参数不对"), raw_output="")
+
+        adapter = MockAdapter(mock_manifest(), overrides={"C18": always_input_error})
+        holder["a"] = adapter
+        with Sandbox(adapters=[adapter]) as sandbox:
+            envelope = sandbox.run(
+                "run_course", confirmed=True, course_id="C1", risk_retries=3, risk_wait=0
+            )
+        self.assertEqual(len(calls), 1, "非风控失败不应重试")
+        self.assertFalse(envelope.ok)
+
+
+class RiskControlDetectionTests(unittest.TestCase):
+    """`_is_risk_control` 的判定（续跑的开关，判错会误重试或漏续跑）。"""
+
+    def _env(self, **kw: Any) -> Envelope:
+        base = dict(
+            ok=False, command="run_course", request_id="r", account="a",
+            state="failed", started_at="", finished_at="", duration_ms=0,
+        )
+        base.update(kw)
+        return Envelope(**base)  # type: ignore[arg-type]
+
+    def test_category_risk_control(self) -> None:
+        from orchestrator.services import _is_risk_control
+
+        self.assertTrue(_is_risk_control(self._env(error={"category": "risk_control"})))
+
+    def test_code_suspected(self) -> None:
+        from orchestrator.services import _is_risk_control
+
+        self.assertTrue(
+            _is_risk_control(self._env(error={"code": "RISK_CONTROL_SUSPECTED"}))
+        )
+
+    def test_blocked_state(self) -> None:
+        from orchestrator.services import _is_risk_control
+
+        self.assertTrue(_is_risk_control(self._env(state="blocked")))
+
+    def test_success_is_not_risk(self) -> None:
+        from orchestrator.services import _is_risk_control
+
+        self.assertFalse(_is_risk_control(self._env(ok=True, state="completed")))
+
+    def test_other_error_is_not_risk(self) -> None:
+        from orchestrator.services import _is_risk_control
+
+        self.assertFalse(_is_risk_control(self._env(error={"category": "auth"})))
 
 
 class EnvelopeContractTests(unittest.TestCase):

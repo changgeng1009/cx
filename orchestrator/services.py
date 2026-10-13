@@ -402,9 +402,7 @@ class Orchestrator:
             target_types=[str(t) for t in target_types],
         )
         checkpoint.state = TaskState.RUNNING
-        skipped_ids = set(checkpoint.completed_task_points) | {
-            str(s.get("id")) for s in checkpoint.skipped_task_points
-        }
+        # 跳过集合在每次（重试）执行前按最新 checkpoint 重算 —— 见下方续跑循环
 
         driver = _CheckpointDriver(checkpoint, logger)
         driver.to(TaskState.PENDING if dry_run else TaskState.RUNNING)
@@ -420,16 +418,46 @@ class Orchestrator:
         )
 
         router = self._make_router(logger)
-        call_params = {
-            **params,
-            "course_id": course_id,
-            "target_types": [str(t) for t in target_types],
-            "skip_task_point_ids": sorted(skipped_ids),
-            "dry_run": dry_run,
-        }
-        outcome = router.execute(
-            spec.capability or "C18", call_params, ctx, command=command
+        # 风控自动续跑：被平台熔断（403/FORBIDDEN）后等待一段时间再重试同一门课。
+        # 安全性依据：checkpoint 记录了已完成的任务点，每轮重试都会把它们放进
+        # skip_task_point_ids，所以**重复执行不会重刷已完成的部分** —— 只补剩下的。
+        risk_retries = max(int(params.get("risk_retries") or 0), 0)
+        risk_wait = float(
+            params.get("risk_wait") if params.get("risk_wait") is not None else 900.0
         )
+        attempt = 0
+        while True:
+            skipped_ids = set(checkpoint.completed_task_points) | {
+                str(s.get("id")) for s in checkpoint.skipped_task_points
+            }
+            call_params = {
+                **params,
+                "course_id": course_id,
+                "target_types": [str(t) for t in target_types],
+                "skip_task_point_ids": sorted(skipped_ids),
+                "dry_run": dry_run,
+            }
+            outcome = router.execute(
+                spec.capability or "C18", call_params, ctx, command=command
+            )
+            if (
+                dry_run
+                or attempt >= risk_retries
+                or not _is_risk_control(outcome)
+                or ctx.cancelled
+                or ctx.pause_requested
+            ):
+                break
+            attempt += 1
+            logger.emit(
+                Event.RISK_CONTROL_DETECTED,
+                wait_s=risk_wait,
+                attempt=attempt,
+                max_attempts=risk_retries,
+                completed=len(checkpoint.completed_task_points),
+                note="风控拦停：等待后自动续跑（已完成的任务点会被跳过）",
+            )
+            time.sleep(risk_wait)
 
         stopped_reason = ""
         if outcome.ok and isinstance(outcome.data, dict):
@@ -1657,6 +1685,31 @@ class Orchestrator:
             fallback_count=len(envelope.fallback_trace),
         )
         return envelope
+
+
+def _is_risk_control(outcome: Envelope) -> bool:
+    """这次执行是否因**风控**被熔断（供自动续跑判定）。
+
+    判据用 error.category（`risk_control`）而不是看文案；同时兜住 code，
+    因为 Router 可能把它包成 RISK_CONTROL_SUSPECTED。
+    state == "blocked" 也认（账号冷却期）。
+
+    注意 `Envelope.error` 内存里是 **AdapterError 对象**、序列化后才是 dict，
+    所以两种形态都要兼容（踩过：只判 dict 会 AttributeError）。
+    """
+    if outcome.ok:
+        return False
+    err = outcome.error
+    if err is not None:
+        category = (
+            err.get("category") if isinstance(err, dict) else getattr(err, "category", None)
+        )
+        code = err.get("code") if isinstance(err, dict) else getattr(err, "code", None)
+        if str(category or "") == ErrorCategory.RISK_CONTROL:
+            return True
+        if str(code or "") == Codes.RISK_CONTROL_SUSPECTED:
+            return True
+    return str(outcome.state or "") == TaskState.BLOCKED
 
 
 class _CheckpointDriver:

@@ -134,6 +134,18 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="秒完成任务点之间的最大间隔秒数（默认 45）",
         )
+        p.add_argument(
+            "--risk-retries",
+            type=int,
+            default=None,
+            help="被风控熔断后自动等待并重试同一门课的次数（默认 0=不重试；已完成的任务点会跳过）",
+        )
+        p.add_argument(
+            "--risk-wait",
+            type=float,
+            default=None,
+            help="每次风控重试前的等待秒数（默认 900）",
+        )
     p = add("run_chapter", "只跑指定章节")
     p.add_argument("--course-id", required=True)
     p.add_argument("--chapter-id", required=True)
@@ -167,6 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="秒完成任务点之间的最大间隔秒数（默认 45）",
+    )
+    p.add_argument(
+        "--risk-retries",
+        type=int,
+        default=None,
+        help="被风控熔断后自动等待并重试同一门课的次数（默认 0=不重试；已完成的任务点会跳过）",
+    )
+    p.add_argument(
+        "--risk-wait",
+        type=float,
+        default=None,
+        help="每次风控重试前的等待秒数（默认 900）",
     )
 
     # ---- 控制 ----
