@@ -219,6 +219,70 @@ class SignCapabilityTests(unittest.TestCase):
         self.assertFalse(result.ok)
 
 
+class WorkerGuardTests(unittest.TestCase):
+    """worker 的两道环境防护 —— 都是"跑批静默卡死"事故的产物。"""
+
+    def test_import_guard_makes_import_fail_fast(self) -> None:
+        """被屏蔽的模块必须**立刻**抛 ImportError（ddddocr 会卡在 import numpy）。"""
+        import time
+
+        from orchestrator.adapters.cxcli_worker import install_import_guards
+
+        install_import_guards(("cx_guard_probe_mod",))
+        start = time.monotonic()
+        with self.assertRaises(ImportError):
+            import cx_guard_probe_mod  # noqa: F401
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_import_guard_is_idempotent_and_additive(self) -> None:
+        import sys
+
+        from orchestrator.adapters.cxcli_worker import _ImportBlocker, install_import_guards
+
+        install_import_guards(("cx_guard_a",))
+        install_import_guards(("cx_guard_a", "cx_guard_b"))
+        names = {n for f in sys.meta_path if isinstance(f, _ImportBlocker) for n in f._names}
+        self.assertIn("cx_guard_a", names)
+        self.assertIn("cx_guard_b", names)
+        # 同名不重复装：blocker 数量不应随调用次数增长
+        count_before = sum(1 for f in sys.meta_path if isinstance(f, _ImportBlocker))
+        install_import_guards(("cx_guard_a",))
+        self.assertEqual(sum(1 for f in sys.meta_path if isinstance(f, _ImportBlocker)), count_before)
+
+    def test_network_guard_sets_default_timeout(self) -> None:
+        from orchestrator.adapters.cxcli_worker import install_network_guards
+
+        install_network_guards(42.0)
+        import requests
+
+        self.assertGreater(
+            getattr(requests.sessions.Session.request, "_cx_timeout_default", 0), 0
+        )
+
+    def test_network_guard_does_not_override_explicit_timeout(self) -> None:
+        """已显式传 timeout 的调用不能被改写。"""
+        from unittest import mock
+
+        import requests
+
+        from orchestrator.adapters.cxcli_worker import install_network_guards
+
+        install_network_guards(30.0)
+        session = requests.Session()
+        with mock.patch.object(
+            requests.sessions.Session, "send", autospec=True
+        ) as send:
+            send.return_value = mock.Mock(status_code=200, headers={}, text="")
+            try:
+                session.get("http://example.invalid", timeout=7)
+            except Exception:  # noqa: BLE001 —— 只关心传给底层请求的参数
+                pass
+            sent = send.call_args
+            self.assertIsNotNone(sent)
+            # timeout 是 send(**kwargs) 的参数，不在 PreparedRequest 上
+            self.assertEqual(sent.kwargs.get("timeout"), 7)
+
+
 class QuizRecheckTests(unittest.TestCase):
     """M5 假失败兜底：quiz 报错后复扫平台，任务点消失即视为已完成。"""
 

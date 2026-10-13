@@ -73,6 +73,67 @@ class ControlFlag:
                 return
 
 
+class _ImportBlocker:
+    """让指定模块的 import 立即抛 ImportError，而不是挂死。
+
+    用途：ddddocr（上游"自动过验证码"的依赖）在本环境里会停在
+    `import numpy` 永不返回。实测（2026-10-13）：视频进度上报触发
+    403 验证码后，worker 僵死 9 分钟，CPU 0%、py-spy 栈顶为
+    numpy._core.multiarray。屏蔽后上游走它自己的降级路径
+    （HAS_DDDDOCR=False → ocr_init() 返回 None → try_pass() 快速失败 →
+    跳过该任务点）——**把"静默挂死"变成"明确跳过"**。
+    """
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self._names = names
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        for name in self._names:
+            if fullname == name or fullname.startswith(name + "."):
+                raise ImportError(
+                    f"{fullname}：被统一层屏蔽（该依赖在本环境 import 会挂死）"
+                )
+        return None
+
+
+def install_import_guards(blocked: tuple[str, ...] = ("ddddocr",)) -> None:
+    """幂等安装 import 黑名单（同名的不会重复安装，可安全多次调用）。"""
+    installed = {
+        name
+        for finder in sys.meta_path
+        if isinstance(finder, _ImportBlocker)
+        for name in finder._names
+    }
+    missing = tuple(name for name in blocked if name not in installed)
+    if missing:
+        sys.meta_path.insert(0, _ImportBlocker(missing))
+
+
+def install_network_guards(default_timeout: float = 30.0) -> None:
+    """给上游所有 requests 调用兜一个默认超时（幂等）。
+
+    上游多处请求未设 timeout（`captcha.getCaptcha`、视频进度上报的
+    `perform_request` 等）；服务端一旦不响应，worker 会**永久阻塞**，
+    表现为跑批"安静地卡住"。这里用类级 patch 覆盖所有 Session 实例
+    （含上游自建的新 session），已显式传 timeout 的调用不受影响。
+    """
+    try:
+        import requests  # noqa: PLC0415 —— 子进程内动态加载
+    except ImportError:
+        return
+    session_cls = requests.sessions.Session
+    original = session_cls.request
+    if getattr(original, "_cx_timeout_default", None):
+        return
+
+    def request(self: Any, method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", default_timeout)
+        return original(self, method, url, **kwargs)
+
+    request._cx_timeout_default = default_timeout  # type: ignore[attr-defined]
+    session_cls.request = request  # type: ignore[method-assign]
+
+
 def prepare_upstream_env(upstream_path: str) -> None:
     """把上游的资源基准指到上游目录（字体反爬映射表必需）。
 
@@ -89,6 +150,9 @@ def prepare_upstream_env(upstream_path: str) -> None:
     if upstream not in sys.path:
         sys.path.insert(0, upstream)
     sys._MEIPASS = upstream  # type: ignore[attr-defined]
+    # 环境防护：必须在任何上游请求/导入之前装好
+    install_import_guards()
+    install_network_guards()
 
 
 def build_tiku(upstream_path: str, shim_endpoint: str, submit: bool = False) -> Any:
