@@ -25,7 +25,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from .answer_broker import AnswerBroker, parse_answers
+from .answer_broker import AnswerBroker, Ticket, parse_answers
+from .models import TicketState
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -189,16 +190,50 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        model = str(payload.get("model") or DEFAULT_MODEL)
-        ticket = self.broker.create_ticket(raw_prompt=prompt, timeout_s=self.broker.timeout_s)
-        if self.echo is not None:
-            self.echo(
-                f"[shim] 新工单 {ticket.ticket_id}："
-                f"{len(ticket.questions)} 题已解析，等待操控 Agent 应答"
-            )
+        self._send_json(200, handle_chat_payload(self.broker, payload, self.echo))
 
-        answered = self.broker.wait(ticket.ticket_id)
-        self._send_json(200, self.broker.to_openai_response(answered, model=model))
+
+def handle_chat_payload(
+    broker: AnswerBroker,
+    payload: dict[str, Any],
+    echo: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """把一次 chat/completions 请求变成 OpenAI 格式的答案响应。
+
+    两条路径：
+    1. **已知答案直答**：`runs/answer/known_answers.json` 命中 → 立即返回，不开单、不等待。
+       为什么需要：上游在章节检测**重做轮**会故意绕过它自己的 CacheDAO
+       （`skip_cache = bool(work_feedback)`），同一套题会再逐题问过来；
+       没有这层的话每题都要空等到超时，一门课能被拖几个小时。
+    2. **开单等待操控 Agent**：这是 M5 的默认路径（题目 → 工单 → Agent 作答）。
+    """
+    prompt = extract_prompt(payload)
+    model = str(payload.get("model") or DEFAULT_MODEL)
+
+    known = broker.lookup_known(prompt)
+    if known is not None:
+        if echo is not None:
+            tail = (prompt.strip().splitlines() or [""])[-1]
+            echo(f"[shim] 已知答案直答：{tail[:40]}")
+        return broker.to_openai_response(
+            Ticket(
+                ticket_id="known-answer",
+                raw_prompt=prompt,
+                state=TicketState.ANSWERED,
+                answers=[known],
+                answered_by="known-answers",
+            ),
+            model=model,
+        )
+
+    ticket = broker.create_ticket(raw_prompt=prompt, timeout_s=broker.timeout_s)
+    if echo is not None:
+        echo(
+            f"[shim] 新工单 {ticket.ticket_id}："
+            f"{len(ticket.questions)} 题已解析，等待操控 Agent 应答"
+        )
+    answered = broker.wait(ticket.ticket_id)
+    return broker.to_openai_response(answered, model=model)
 
 
 def build_server(

@@ -466,6 +466,98 @@ class StaleTicketTests(unittest.TestCase):
             self.assertIn(ticket.ticket_id, [t.ticket_id for t in broker.pending()])
 
 
+class KnownAnswersTests(unittest.TestCase):
+    """已知答案直答：上游重做轮绕过自己的缓存时，代理层仍要能秒答。"""
+
+    def _write(self, sandbox, rows) -> None:
+        path = sandbox.ctx.broker.known_answers_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+
+    def test_lookup_hits_by_keyword(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(sandbox, [{"contains": "纯电阻性用电设备", "answer": "6KVA"}])
+            hit = broker.lookup_known("题目：单相线路接三个纯电阻性用电设备，求视在功率")
+            self.assertEqual(hit, "6KVA")
+
+    def test_lookup_miss_returns_none(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(sandbox, [{"contains": "别的题", "answer": "A"}])
+            self.assertIsNone(broker.lookup_known("完全无关的题目"))
+
+    def test_missing_file_is_not_an_error(self) -> None:
+        with Sandbox() as sandbox:
+            self.assertIsNone(sandbox.ctx.broker.lookup_known("任意题目"))
+
+    def test_first_match_wins(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(
+                sandbox,
+                [
+                    {"contains": "电压偏差", "answer": "+5,-5"},
+                    {"contains": "电压", "answer": "别的"},
+                ],
+            )
+            self.assertEqual(broker.lookup_known("一般工作场所照明电压偏差"), "+5,-5")
+
+    def test_question_text_anchors_to_last_question_marker(self) -> None:
+        """重做轮的 prompt 里带错题反馈（含别的题），必须只匹配「题目：」段。"""
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(
+                sandbox,
+                [
+                    {"contains": "纯电阻性用电设备", "answer": "6KVA"},
+                    {"contains": "P=4kW，cosφ=0.9", "answer": "20"},
+                ],
+            )
+            # 模拟 A1 重做轮的形态：系统提示里带上一轮错题反馈（含第一题题干）
+            prompt = (
+                "本题为填空题，你必须根据语境和相关知识填入合适的内容\n"
+                "上一轮错误反馈：1【单选题】单相线路接三个纯电阻性用电设备，"
+                "功率分别为1kW、2kW、3 kW，求线路的视在功率（ ）。\n"
+                "题目：【填空题】某单相线路，P=4kW，cosφ=0.9，则电流I=（ ）A.（取整数）"
+            )
+            self.assertEqual(broker.lookup_known(prompt), "20")
+
+    def test_longest_keyword_wins(self) -> None:
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(
+                sandbox,
+                [
+                    {"contains": "电压称为", "answer": "短"},
+                    {"contains": "通常将交流1kv以下的电压称为", "answer": "低压"},
+                ],
+            )
+            self.assertEqual(
+                broker.lookup_known("题目：通常将交流1kv以下的电压称为:____。"), "低压"
+            )
+
+    def test_shim_answers_without_ticket(self) -> None:
+        """端到端：命中已知答案时，不产生工单、直接回 OpenAI 格式。"""
+        from orchestrator.openai_shim import handle_chat_payload
+
+        with Sandbox() as sandbox:
+            broker = sandbox.ctx.broker
+            self._write(sandbox, [{"contains": "灯具指的是", "answer": "照明器\n控照器\n光源"}])
+            resp = handle_chat_payload(
+                broker,
+                {
+                    "model": "agent-in-the-loop",
+                    "messages": [
+                        {"role": "user", "content": "题目：【多选题】灯具指的是?"}
+                    ],
+                },
+            )
+            self.assertEqual(broker.pending(), [])
+            parsed = json.loads(resp["choices"][0]["message"]["content"])
+            self.assertEqual(parsed["Answer"], ["照明器\n控照器\n光源"])
+
+
 class A1ProviderFormatTests(unittest.TestCase):
     """M5：对齐 A1 `AI` provider 的真实发题/收答格式（实测校准）。"""
 

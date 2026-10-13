@@ -117,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="M5：答完后正式提交章节检测（默认只作答不提交；提交不可逆，慎用）",
         )
+        p.add_argument(
+            "--shim-endpoint",
+            default=None,
+            help="M5：本地答题代理地址（默认 http://127.0.0.1:8765/v1；端口被占时改这里）",
+        )
     p = add("run_chapter", "只跑指定章节")
     p.add_argument("--course-id", required=True)
     p.add_argument("--chapter-id", required=True)
@@ -133,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--submit-answers",
         action="store_true",
         help="M5：答完后正式提交章节检测（默认只作答不提交；提交不可逆，慎用）",
+    )
+    p.add_argument(
+        "--shim-endpoint",
+        default=None,
+        help="M5：本地答题代理地址（默认 http://127.0.0.1:8765/v1；端口被占时改这里）",
     )
 
     # ---- 控制 ----

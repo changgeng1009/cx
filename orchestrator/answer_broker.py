@@ -438,6 +438,78 @@ class AnswerBroker:
             self._audit(ticket)
         return ticket
 
+    # ------------------------------------------------------------------
+    # 已知答案（可选加速层）
+    # ------------------------------------------------------------------
+    def known_answers_path(self) -> Path:
+        return self.root / "known_answers.json"
+
+    def load_known_answers(self) -> list[dict[str, str]]:
+        """读取 `runs/answer/known_answers.json`（按 mtime 缓存，便于热更新）。
+
+        格式：[{"contains": "题干特征子串", "answer": "选项原文"}, ...]，按序首条命中生效。
+        """
+        path = self.known_answers_path()
+        if not path.is_file():
+            return []
+        mtime = path.stat().st_mtime
+        cached = getattr(self, "_known_cache", None)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        rows = [
+            {"contains": str(r.get("contains") or ""), "answer": str(r.get("answer") or "")}
+            for r in raw
+            if isinstance(r, dict) and r.get("contains") and r.get("answer")
+        ]
+        self._known_cache = (mtime, rows)
+        return rows
+
+    @staticmethod
+    def extract_question_text(prompt: str) -> str:
+        """从 A1 的 prompt 里只取「题目：」那一段。
+
+        **为什么必须锚定**：A1 在章节检测的**重做轮**会把上一轮的错题反馈塞进
+        prompt（`set_work_feedback`），反馈文本里含**其它题**的题干。若直接拿整个
+        prompt 做关键词匹配就会串题 —— 实测事故：3.3.1 四道题在重做轮里全被答成
+        第一题的答案「6KVA」，把本来正确的卷子改错了。
+
+        取最后一个「题目：」，并截到「选项：」或空行为止（反馈里也可能出现「题目：」）。
+        """
+        text = str(prompt or "")
+        idx = text.rfind("题目：")
+        if idx < 0:
+            return text
+        tail = text[idx + len("题目：") :]
+        for stop in ("\n选项：", "\n选项:", "\n\n"):
+            pos = tail.find(stop)
+            if pos >= 0:
+                tail = tail[:pos]
+        return tail.strip()
+
+    def lookup_known(self, prompt: str) -> str | None:
+        """按题干特征匹配已备好的答案；命中则无需开单等待。
+
+        为什么要这层：上游在**重做轮**会故意绕过它的 CacheDAO（`skip_cache =
+        bool(work_feedback)`），于是同一套题会再次逐题问过来 —— 每题要空等
+        直到超时。把答案直接交给代理层，重做轮也能秒答。
+
+        匹配规则：① 只在「题目：」段内匹配（见 extract_question_text 的串题事故）；
+        ② 命中最长的关键词优先（更具体的条目赢，避免短词误配）。
+        """
+        text = self.extract_question_text(prompt)
+        best_keyword = ""
+        best_answer: str | None = None
+        for row in self.load_known_answers():
+            keyword = row["contains"]
+            if keyword in text and len(keyword) > len(best_keyword):
+                best_keyword = keyword
+                best_answer = row["answer"]
+        return best_answer
+
     def stats(self) -> dict[str, Any]:
         """队列计数：待答 / 已答 / 过期，三者互斥且合计等于总数。"""
         self.ensure_dirs()
