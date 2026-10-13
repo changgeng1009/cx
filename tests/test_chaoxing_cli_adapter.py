@@ -213,6 +213,19 @@ class SignCapabilityTests(unittest.TestCase):
         self.assertEqual(result.data["outcome"], "unknown")
         self.assertEqual(result.data["status"], "unknown")
 
+    def test_run_passes_pace_params(self) -> None:
+        req = self._capture(
+            "C18", {"course_id": "1", "pace_min": 7, "pace_max": 11}
+        )
+        self.assertEqual(float(req["args"]["pace_min"]), 7.0)
+        self.assertEqual(float(req["args"]["pace_max"]), 11.0)
+
+    def test_run_omits_pace_when_absent(self) -> None:
+        """不给就用 worker 的默认值（20~45s），不能塞 None 进去。"""
+        req = self._capture("C18", {"course_id": "1"})
+        self.assertNotIn("pace_min", req["args"])
+        self.assertNotIn("pace_max", req["args"])
+
     def test_c51_is_not_claimed(self) -> None:
         """签退未实现：不能装作支持（如实返回 unsupported）。"""
         result = self.adapter.invoke("C51", {}, self.ctx)
@@ -281,6 +294,49 @@ class WorkerGuardTests(unittest.TestCase):
             self.assertIsNotNone(sent)
             # timeout 是 send(**kwargs) 的参数，不在 PreparedRequest 上
             self.assertEqual(sent.kwargs.get("timeout"), 7)
+
+
+class PaceTests(unittest.TestCase):
+    """秒完成任务点的限速 —— 防平台判「操作异常」（实测 9010 验证码 → 403 熔断）。"""
+
+    def setUp(self) -> None:
+        from orchestrator.adapters import cxcli_worker
+
+        self.w = cxcli_worker
+
+    def test_fast_job_waits_within_range(self) -> None:
+        import time as _time
+        from unittest import mock
+
+        with mock.patch.object(self.w, "_emit"), mock.patch.object(self.w.time, "sleep") as sl:
+            wait = self.w.pace_fast_job(_time.monotonic(), 5.0, 10.0)
+        self.assertGreaterEqual(wait, 5.0)
+        self.assertLessEqual(wait, 10.0)
+        sl.assert_called_once()
+
+    def test_slow_job_does_not_wait(self) -> None:
+        """真播放（耗时数分钟）不需要额外间隔 —— 它本身已足够慢。"""
+        import time as _time
+
+        wait = self.w.pace_fast_job(_time.monotonic() - 100, 5.0, 10.0)
+        self.assertEqual(wait, 0.0)
+
+    def test_zero_disables_pacing(self) -> None:
+        import time as _time
+
+        self.assertEqual(self.w.pace_fast_job(_time.monotonic(), 0.0, 10.0), 0.0)
+
+    def test_hi_not_below_lo(self) -> None:
+        """传反了也要能用（取 max），不能睡负数。"""
+        import time as _time
+        from unittest import mock
+
+        with mock.patch.object(self.w, "_emit"), mock.patch.object(self.w.time, "sleep"):
+            wait = self.w.pace_fast_job(_time.monotonic(), 8.0, 3.0)
+        self.assertGreaterEqual(wait, 8.0)
+
+    def test_default_constants(self) -> None:
+        self.assertGreater(self.w.FAST_JOB_SECONDS, 0)
 
 
 class QuizRecheckTests(unittest.TestCase):

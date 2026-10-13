@@ -122,6 +122,18 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="M5：本地答题代理地址（默认 http://127.0.0.1:8765/v1；端口被占时改这里）",
         )
+        p.add_argument(
+            "--pace-min",
+            type=float,
+            default=None,
+            help="秒完成任务点之间的最小间隔秒数（默认 20；防平台判「操作异常」；0=不限速）",
+        )
+        p.add_argument(
+            "--pace-max",
+            type=float,
+            default=None,
+            help="秒完成任务点之间的最大间隔秒数（默认 45）",
+        )
     p = add("run_chapter", "只跑指定章节")
     p.add_argument("--course-id", required=True)
     p.add_argument("--chapter-id", required=True)
@@ -143,6 +155,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--shim-endpoint",
         default=None,
         help="M5：本地答题代理地址（默认 http://127.0.0.1:8765/v1；端口被占时改这里）",
+    )
+    p.add_argument(
+        "--pace-min",
+        type=float,
+        default=None,
+        help="秒完成任务点之间的最小间隔秒数（默认 20；防平台判「操作异常」；0=不限速）",
+    )
+    p.add_argument(
+        "--pace-max",
+        type=float,
+        default=None,
+        help="秒完成任务点之间的最大间隔秒数（默认 45）",
     )
 
     # ---- 控制 ----

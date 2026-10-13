@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 EXIT_OK = 0
@@ -208,6 +210,38 @@ def build_client(upstream_path: str, tiku: Any = None):
 
 def job_type_of(job: dict) -> str:
     return _JOB_TYPE_MAP.get(str(job.get("type") or ""), "unknown")
+
+
+# 低于此耗时说明任务点走的是"直接上报"快路径（日志 `任务瞬间完成`）
+FAST_JOB_SECONDS = 5.0
+
+
+def pace_fast_job(t0: float, lo: float, hi: float) -> float:
+    """给"秒完成"的任务点拉开随机间隔（返回实际等待秒数）。
+
+    **为什么必须限速**（实测事故，2026-10-13 供配电）：上游对视频走快路径 ——
+    一上来就按完整时长直接上报（`study_video` 里 `_isdrag=4` 那次调用），
+    平台接受即"任务瞬间完成"。于是一次跑批能在 **5 分钟内上报几十个任务点**。
+    平台据此判定操作异常，返回「【9010】操作异常，请输入图片中的验证码」，
+    随后视频上报 403 → worker 熔断，整门课中断（已完成 122/129，但风控被记上）。
+
+    真播放的任务点本身耗时数分钟，节奏已经足够慢，不需要额外等待 —— 所以这里
+    只看耗时：**快完成的才补间隔**。lo<=0 时不限速（关闭开关）。
+    """
+    if lo <= 0:
+        return 0.0
+    if time.monotonic() - t0 >= FAST_JOB_SECONDS:
+        return 0.0
+    wait = random.uniform(lo, max(hi, lo))
+    _emit(
+        {
+            "event": "pace_wait",
+            "seconds": round(wait, 1),
+            "note": "秒完成任务点之间的间隔（防平台判定操作异常）",
+        }
+    )
+    time.sleep(wait)
+    return wait
 
 
 def do_login(client, use_cookies: bool = True) -> tuple[bool, str]:
@@ -456,6 +490,9 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
     allow_work = bool(args.get("allow_work"))
     chapter_filter = str(args.get("chapter_id") or "")
     dry_run = bool(args.get("dry_run"))
+    # 秒完成任务点的间隔区间（秒）：防平台判「操作异常」（见 pace_fast_job）
+    pace_min = float(args.get("pace_min") if args.get("pace_min") is not None else 20.0)
+    pace_max = float(args.get("pace_max") if args.get("pace_max") is not None else 45.0)
 
     raw_points = scan_course_points(client, course)
     points = [point_row(p) for p in raw_points]
@@ -529,6 +566,7 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
                 continue
 
             _emit({"event": "job_start", "task_point_id": job_id, "type": jtype})
+            job_t0 = time.monotonic()
             try:
                 result = cxmain.process_job(client, course, job, job_info, speed)
                 ok = (result == cxmain.StudyResult.SUCCESS)
@@ -539,11 +577,13 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
                     _emit({"event": "job_recheck", "task_point_id": job_id, "type": jtype,
                            "note": "上游抛异常，复扫平台确认已完成"})
                     completed.append(job_id)
+                    pace_fast_job(job_t0, pace_min, pace_max)
                     continue
                 _emit({"event": "job_done", "task_point_id": job_id, "type": jtype,
                        "result": "ERROR", "error": f"{type(exc).__name__}: {exc}"})
                 failed.append({"id": job_id, "type": jtype, "result": "ERROR"})
                 chapter_failed = True
+                pace_fast_job(job_t0, pace_min, pace_max)
                 continue
 
             if result == cxmain.StudyResult.FORBIDDEN:
@@ -552,6 +592,7 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
                        "result": "FORBIDDEN"})
                 failed.append({"id": job_id, "type": jtype, "result": "FORBIDDEN"})
                 chapter_failed = True
+                pace_fast_job(job_t0, pace_min, pace_max)
                 continue
 
             _emit({"event": "job_done", "task_point_id": job_id, "type": jtype,
@@ -569,6 +610,7 @@ def run_course(client, course: dict, args: dict, flag: ControlFlag) -> dict:
             else:
                 failed.append({"id": job_id, "type": jtype, "result": str(result)})
                 chapter_failed = True
+            pace_fast_job(job_t0, pace_min, pace_max)
 
         if stopped_reason != "finished":
             break

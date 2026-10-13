@@ -304,6 +304,12 @@ class ChaoxingCliAdapter(Adapter):
             )
             # 默认不交卷（安全默认）：答完只在平台侧保存，由使用者决定是否正式提交
             args["tiku_submit"] = "true" if params.get("submit_answers") else "false"
+            # 秒完成任务点的间隔（秒）：防平台判「操作异常」（9010 验证码 → 403 熔断）。
+            # 不传则由 worker 用默认值 20~45s；传 0 可关闭限速。
+            if params.get("pace_min") is not None:
+                args["pace_min"] = params.get("pace_min")
+            if params.get("pace_max") is not None:
+                args["pace_max"] = params.get("pace_max")
 
         if op == "sign_scan":
             # CLI 给的是 `--all`（要看已结束的）；能力声明里是 only_running
