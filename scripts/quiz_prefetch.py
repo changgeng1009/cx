@@ -23,7 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = ROOT / "upstreams" / "chaoxing"
-ACCOUNT_DIR = ROOT / "accounts" / "acc_01" / "upstream" / "chaoxing"
+ACCOUNT_ID = "acc_01"
+ACCOUNT_DIR = ROOT / "accounts" / ACCOUNT_ID / "upstream" / "chaoxing"
 
 sys.path.insert(0, str(ROOT))
 from orchestrator.adapters.cxcli_worker import (  # noqa: E402
@@ -91,9 +92,22 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("course_id")
     ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--account", default="acc_01", help="账号 ID（le 工作区，默认 acc_01）")
     args = ap.parse_args()
 
-    out_path = Path(args.out) if args.out else ROOT / "runs" / f"quiz_prefetch_{args.course_id}.json"
+    # 多账号：账号工作区决定 cookie 与 cache.json 的位置
+    global ACCOUNT_DIR
+    ACCOUNT_DIR = ROOT / "accounts" / args.account / "upstream" / "chaoxing"
+    os.chdir(ACCOUNT_DIR)
+
+    # 注意：脚本会 chdir 到账号工作区（上游从 CWD 读 cookie/cache），
+    # 所以相对输出路径必须按 ROOT 解析 —— 否则会落到账号目录里（踩过两次）
+    if args.out:
+        out_path = Path(args.out)
+        if not out_path.is_absolute():
+            out_path = ROOT / out_path
+    else:
+        out_path = ROOT / "runs" / f"quiz_prefetch_{args.course_id}.json"
     client = Chaoxing(Account("", ""), tiku=None)
     ok, state = client.login(login_with_cookies=True)
     if not ok:

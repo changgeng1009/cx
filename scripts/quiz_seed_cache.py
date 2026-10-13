@@ -20,7 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = ROOT / "upstreams" / "chaoxing"
-ACCOUNT_DIR = ROOT / "accounts" / "acc_01" / "upstream" / "chaoxing"
+ACCOUNT_ID = "acc_01"
+ACCOUNT_DIR = ROOT / "accounts" / ACCOUNT_ID / "upstream" / "chaoxing"
 
 sys.path.insert(0, str(ROOT))
 from orchestrator.adapters.cxcli_worker import prepare_upstream_env  # noqa: E402
@@ -168,6 +169,18 @@ TABLE: list[tuple[str, object]] = [
     ("照明回路有40W双管荧光灯10盏", "960W"),
     ("房间面积约为60平", "3kW"),
     ("照明负荷功率因数一般取", "0.85-0.9"),
+    # ---- 电机课（233418133）章节检测，acc_02 实测抽到 ----
+    ("低压电器是指工作电压在交流", "1200\n1500"),
+    ("电磁式电器触点的形式有点接触", "正确"),
+    ("线圈通电后闭合的触头叫常闭触头", "错误"),
+    # ---- acc_02 抽到、而 acc_01 没有的 8 题（同一门课按学生抽题，实测差异 11 题）----
+    ("每一个用户都采用专线供电", "放射式"),
+    ("每个用戶的用电线路都从干线接出", "树干式"),  # 注意原文是繁体「用戶」
+    ("单相线路的接单相负荷", "6kW"),
+    ("A相设备功率为6kW", "27"),        # 最大相 9kW × 3
+    ("三相线路的接三相负荷", "23kW"),     # 三相负荷直接相加 8+7+8
+    ("求三相等效功率", "22"),          # 最大相 4kW × 3 + 三相设备 10kW
+    ("线路可分为进户线、干线和支线", "对"),  # 3.7.2 / 3.7.3 各一道
     # ---- 结构性无法作答的题（选项内容平台渲染成图片，JSON 里只有 A/B/C/D 占位）----
     # 给"有依据的猜测"而不是让跑批空等：这些题在平台上前 4-5 秒就会被随机作答，
     # 猜一个至少有方向的选项，比随机的期望更高（12盏灯→4列→四联开关）。
@@ -191,7 +204,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--course-id", default="250292520")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--account", default="acc_01", help="账号 ID（决定 cache.json 落在哪个工作区）")
     args = ap.parse_args()
+
+    global ACCOUNT_DIR
+    ACCOUNT_DIR = ROOT / "accounts" / args.account / "upstream" / "chaoxing"
+    # 必须重新 chdir：CacheDAO 的 cache.json 是 CWD 相对路径，
+    # 只改变量不切目录会把缓存写进别的账号（踩过）
+    os.chdir(ACCOUNT_DIR)
 
     src = ROOT / "runs" / f"quiz_prefetch_{args.course_id}.json"
     data = json.loads(src.read_text(encoding="utf-8"))
